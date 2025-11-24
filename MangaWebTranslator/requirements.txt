@@ -1,0 +1,11 @@
+pytesseract
+selenium
+Pillow
+opencv-python
+numpy
+requests
+PyQt6
+orjson
+lxml
+svgpathtools
+webdriver-manager
