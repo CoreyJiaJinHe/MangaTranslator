@@ -1,19 +1,17 @@
 """Primary application window implementation.
 
-Enhancements in this revision:
-  - Panel area dominates window; side panel fixed narrow width.
-  - Embedded web browsing via QWebEngineView (if available) with URL open action.
-  - Capture current web view as screenshot panel card.
-  - Selenium stub action: launches external Selenium-controlled browser and imports initial screenshot.
+Embedded browser (PyQt6-WebEngine) with address bar, header injection,
+panel grid management, OCR stubs, and export placeholder.
 
-If PyQt6-WebEngine is missing, a placeholder widget informs the user to install it.
+Selenium support removed: embedded browser is now the sole navigation mechanism.
+If PyQt6-WebEngine is missing, a placeholder widget informs the user.
 """
 from __future__ import annotations
 
 from typing import List, Optional
 import os
 
-from PyQt6.QtCore import Qt, pyqtSignal, QSize
+from PyQt6.QtCore import Qt, pyqtSignal, QSize, QThread, QObject
 from PyQt6.QtGui import QAction, QPixmap
 from PyQt6.QtWidgets import (
     QMainWindow,
@@ -31,6 +29,8 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QDialog,
+    QApplication,
 )
 
 
@@ -200,11 +200,8 @@ class MainWindow(QMainWindow):
         self.actExport = QAction("Export Text", self)
         self.actOpenUrl = QAction("Open URL", self)
         self.actCaptureWeb = QAction("Capture WebView", self)
-        self.actSeleniumStart = QAction("Selenium Start", self)
-        self.actSeleniumNav = QAction("Selenium Navigate", self)
-        self.actSeleniumScreenshot = QAction("Selenium Screenshot", self)
-        self.actSeleniumSelectRegion = QAction("Select Region (OCR)", self)
-        self.actSeleniumScrapeImages = QAction("Scrape Images", self)
+        # Removed Selenium-related actions; embedded browser now primary.
+        self.actScrapeImages = QAction("Scrape Images", self)
 
     def _createToolbar(self):
         tb = QToolBar("Main")
@@ -216,12 +213,7 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         tb.addAction(self.actOpenUrl)
         tb.addAction(self.actCaptureWeb)
-        tb.addSeparator()
-        tb.addAction(self.actSeleniumStart)
-        tb.addAction(self.actSeleniumNav)
-        tb.addAction(self.actSeleniumScreenshot)
-        tb.addAction(self.actSeleniumSelectRegion)
-        tb.addAction(self.actSeleniumScrapeImages)
+        tb.addAction(self.actScrapeImages)
         self.addToolBar(tb)
 
     def _createLayout(self):
@@ -233,17 +225,60 @@ class MainWindow(QMainWindow):
         # Web view (conditional import)
         try:
             from PyQt6.QtWebEngineWidgets import QWebEngineView  # type: ignore
+            # Some PyQt6 distributions expose interceptor in QtWebEngineCore; fallback if unavailable.
+            try:
+                from PyQt6.QtWebEngineCore import QWebEngineUrlRequestInterceptor, QWebEngineProfile  # type: ignore
+            except Exception as core_import_err:  # pragma: no cover
+                QWebEngineUrlRequestInterceptor = None  # type: ignore
+                QWebEngineProfile = None  # type: ignore
+                self._webengine_core_error = str(core_import_err)
+            
             self.webView = QWebEngineView(self._stack)
             self.webView.setObjectName("webView")
-        except Exception:
+
+            # Address bar row
+            addr_row = QHBoxLayout()
+            from PyQt6.QtWidgets import QLineEdit, QPushButton
+            self.addressBar = QLineEdit(self._stack)
+            self.addressBar.setPlaceholderText("Enter URL and press Go")
+            self.goBtn = QPushButton("Go", self._stack)
+            addr_row.addWidget(self.addressBar, 1)
+            addr_row.addWidget(self.goBtn)
+            stack_layout.addLayout(addr_row)
+
+            # Interceptor for headers
+            basicHeaders = {
+                b"User-Agent": b"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:143.0) Gecko/20100101 Firefox/143.0",
+                b"Accept": b"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                b"Accept-Language": b"en-CA,en-US;q=0.7,en;q=0.3",
+                b"Accept-Encoding": b"gzip, deflate, br, zstd",
+                b"Cookie": b"",
+            }
+            if QWebEngineUrlRequestInterceptor and QWebEngineProfile:
+                class _HeaderInterceptor(QWebEngineUrlRequestInterceptor):  # type: ignore
+                    def interceptRequest(self, info):  # noqa: D401
+                        # Only inject headers now; do not block hosts so legitimate errors surface.
+                        for k, v in basicHeaders.items():
+                            info.setHttpHeader(k, v)
+                interceptor = _HeaderInterceptor()
+                profile = QWebEngineProfile.defaultProfile()
+                if hasattr(profile, "setUrlRequestInterceptor"):
+                    profile.setUrlRequestInterceptor(interceptor)  # type: ignore[attr-defined]
+                elif hasattr(profile, "setRequestInterceptor"):
+                    profile.setRequestInterceptor(interceptor)  # type: ignore[attr-defined]
+            self.goBtn.clicked.connect(self._onEmbeddedGo)
+            self.addressBar.returnPressed.connect(self._onEmbeddedGo)
+            # JS console messages left intact for debugging Cloudflare / script issues.
+        except Exception as webengine_err:
             self.webView = QWidget(self._stack)
-            placeholder = QLabel("PyQt6-WebEngine not installed. Install to enable embedded browsing.")
+            placeholder = QLabel(f"PyQt6-WebEngine load failed: {webengine_err}\nCheck that PyQt6-WebEngine matches PyQt6 version and that QtWebEngineProcess is present.")
             ph_layout = QVBoxLayout(self.webView)
             ph_layout.addWidget(placeholder)
-        # Initially show panel grid only.
-        stack_layout.addWidget(self.panelGrid, 1)
-        stack_layout.addWidget(self.webView, 1)
-        self.webView.hide()
+        # Initially show embedded browser (preferred) above grid toggle.
+        stack_layout.addWidget(self.webView, 6)
+        stack_layout.addWidget(self.panelGrid, 5)
+        # Show webView by default for navigation experience.
+        self.panelGrid.hide()
 
         self.sidePanel = SidePanel(self)
         self.sidePanel.setFixedWidth(340)
@@ -264,11 +299,7 @@ class MainWindow(QMainWindow):
         self.actExport.triggered.connect(self._onExport)
         self.actOpenUrl.triggered.connect(self._onOpenUrl)
         self.actCaptureWeb.triggered.connect(self._onCaptureWebView)
-        self.actSeleniumStart.triggered.connect(self._onSeleniumStart)
-        self.actSeleniumNav.triggered.connect(self._onSeleniumNavigate)
-        self.actSeleniumScreenshot.triggered.connect(self._onSeleniumScreenshot)
-        self.actSeleniumSelectRegion.triggered.connect(self._onSeleniumSelectRegion)
-        self.actSeleniumScrapeImages.triggered.connect(self._onSeleniumScrapeImages)
+        self.actScrapeImages.triggered.connect(self._onScrapeImages)
 
         # Forward internal signals outward for future service integration.
         self.ocrCompleted.connect(self.sidePanel.setOcrBlocks)
@@ -321,6 +352,7 @@ class MainWindow(QMainWindow):
         summary = f"Panel: {self.sidePanel.current_panel}\nBlocks: {blocks}\nTranslation:\n{translation}"
         QMessageBox.information(self, "Export (stub)", summary)
 
+
     # ----------------------- Web / Selenium -----------------------
     def _ensureWebVisible(self):
         if self.webView.isHidden():
@@ -352,6 +384,20 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.information(self, "WebEngine Missing", "PyQt6-WebEngine not installed.")
 
+    def _onEmbeddedGo(self):
+        if not hasattr(self.webView, "load"):
+            return
+        url = self.addressBar.text().strip()
+        if not url:
+            return
+        if not (url.startswith("http://") or url.startswith("https://")):
+            url = "https://" + url
+        try:
+            from PyQt6.QtCore import QUrl
+            self.webView.load(QUrl(url))
+        except Exception as e:
+            QMessageBox.warning(self, "Go", f"Failed to load: {e}")
+
     def _onCaptureWebView(self):
         if self.webView.isHidden():
             QMessageBox.information(self, "Capture", "Web view not visible.")
@@ -365,157 +411,378 @@ class MainWindow(QMainWindow):
         self.panelGrid.addPanel(panel_id, pm)
         QMessageBox.information(self, "Capture", f"Captured web view as panel {panel_id}.")
 
-    # ----------------------- Selenium Interactive Workflow -----------------------
-    def _seleniumService(self):
-        # Lazy import to avoid hard dependency at import time.
-        from ..services.capture.selenium_capture import SeleniumPanelCapture  # type: ignore
-        if not hasattr(self, "_selenium_capture"):
-            self._selenium_capture = SeleniumPanelCapture()
-        return self._selenium_capture
+    def _onScrapeImages(self):
+        """Extract image sources from the currently loaded page and import them as panels.
 
-    def _onSeleniumStart(self):
-        try:
-            svc = self._seleniumService()
-            svc.ensure_driver()
-            QMessageBox.information(self, "Selenium", "Started Firefox session.")
-        except Exception as e:
-            QMessageBox.warning(self, "Selenium", f"Failed to start Selenium: {e}")
-
-    def _onSeleniumNavigate(self):
-        from PyQt6.QtWidgets import QInputDialog
-        svc = self._seleniumService()
-        if not svc.is_active():
-            QMessageBox.information(self, "Selenium", "Start Selenium first.")
+        Uses JavaScript execution to gather candidate URLs including src, data-src, and first srcset entry.
+        Downloads each (or decodes data URI) and adds to the panel grid. Duplicate URLs are skipped.
+        """
+        if not hasattr(self.webView, 'page'):
+            QMessageBox.warning(self, "Scrape", "Web engine unavailable.")
             return
-        url, ok = QInputDialog.getText(self, "Navigate", "Enter URL:", text="https://")
-        if not ok or not url.strip():
-            return
-        try:
-            svc.navigate(url.strip())
-            QMessageBox.information(self, "Selenium", f"Navigated to {url.strip()}")
-        except Exception as e:
-            QMessageBox.warning(self, "Selenium", f"Navigation failed: {e}")
-
-    def _onSeleniumScreenshot(self):
-        svc = self._seleniumService()
-        if not svc.is_active():
-            QMessageBox.information(self, "Selenium", "Start Selenium first.")
-            return
-        try:
-            out_dir = os.path.join(os.getcwd(), "_selenium_shots")
-            path = svc.screenshot_fullpage(out_dir)
-            pm = QPixmap(path)
-            if pm.isNull():
-                QMessageBox.warning(self, "Screenshot", "Screenshot invalid.")
+        # JavaScript now returns objects with url,width,height to aid filtering.
+        js = r"""
+        (function(){
+          const imgs = Array.from(document.images);
+          const seen = new Set();
+          const out = [];
+          for (const img of imgs) {
+            let cand = img.getAttribute('src') || img.getAttribute('data-src') || '';
+            if (!cand) {
+              const ss = img.getAttribute('srcset');
+              if (ss) {
+                cand = ss.split(',')[0].trim().split(' ')[0];
+              }
+            }
+            if (cand.startsWith('//')) cand = 'https:' + cand; // protocol-relative
+            if (!cand) continue;
+            if (seen.has(cand)) continue;
+            seen.add(cand);
+            const w = img.naturalWidth || img.width || 0;
+            const h = img.naturalHeight || img.height || 0;
+            out.push({url: cand, width: w, height: h});
+          }
+          return out;
+        })();
+        """
+        def after_js(entries):
+            if not entries:
+                QMessageBox.information(self, "Scrape", "No images found.")
                 return
-            # Store screenshot pixmap for region selection.
-            self._last_screenshot_path = path
-            QMessageBox.information(self, "Screenshot", f"Saved screenshot: {os.path.basename(path)}")
+            dlg = ImageSelectionDialog(entries, parent=self)
+            if dlg.exec() != dlg.DialogCode.Accepted:
+                return  # user cancelled selection
+            selected = dlg.selectedUrls()
+            if not selected:
+                QMessageBox.information(self, "Scrape", "No images selected for download.")
+                return
+            self._downloadSelectedImages(selected)
+        try:
+            self.webView.page().runJavaScript(js, after_js)
         except Exception as e:
-            QMessageBox.warning(self, "Screenshot", f"Failed: {e}")
+            QMessageBox.warning(self, "Scrape", f"JS execution failed: {e}")
 
-    def _onSeleniumSelectRegion(self):
-        # Requires a prior screenshot
-        path = getattr(self, "_last_screenshot_path", None)
-        if not path or not os.path.isfile(path):
-            QMessageBox.information(self, "Region", "Capture a screenshot first.")
+    # ----------------------- Background Image Download -----------------------
+    def _downloadSelectedImages(self, urls: list[str]):
+        """Download chosen image URLs using a QThread worker with signals for progress/cancel."""
+        if not urls:
             return
-        pm = QPixmap(path)
+        out_dir = os.path.abspath("_scraped_images")
+        os.makedirs(out_dir, exist_ok=True)
+
+        total = len(urls)
+        from PyQt6.QtWidgets import QProgressDialog
+        progressDlg = QProgressDialog("Downloading images...", "Cancel", 0, total, self)
+        progressDlg.setWindowTitle("Image Download")
+        progressDlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progressDlg.show()
+
+        # Worker object
+        worker = ImageDownloadWorker(urls=urls, out_dir=out_dir, existing_count=lambda: len(self.panelGrid._cards))
+        thread = QThread(self)
+        worker.moveToThread(thread)
+
+        # Wiring
+        worker.progress.connect(lambda idx: progressDlg.setValue(idx))
+        worker.itemReady.connect(lambda panel_id, pm: self.panelGrid.addPanel(panel_id, pm))
+        def done(status: str, added: int, errors: int, cancelled: bool):
+            progressDlg.close()
+            QMessageBox.information(self, "Download", f"{status}. Added {added} image(s). Errors: {errors}")
+            thread.quit()
+            thread.wait(2000)
+            worker.deleteLater()
+            thread.deleteLater()
+        worker.finished.connect(done)
+
+        def request_cancel():
+            worker.cancel()
+        progressDlg.canceled.connect(request_cancel)
+
+        thread.started.connect(worker.run)
+        thread.start()
+
+        # If dialog closed via X while running, treat as cancel.
+        def on_close():
+            if thread.isRunning():
+                worker.cancel()
+        progressDlg.finished.connect(on_close)
+
+
+class ImageSelectionDialog(QDialog):  # type: ignore[name-defined]
+    """Dialog allowing user to choose which images to download.
+
+    Layout: left side shows a scrollable full-size preview (no forced scaling),
+    right side shows the list of images with checkboxes and controls.
+    Supports shift-click range operations: when Shift is held while clicking a
+    checkbox item, all items between the previously clicked item and current
+    are set to the clicked item's new state.
+    Small images (icons/emojis) are pre-unchecked.
+    """
+    def __init__(self, entries: list[dict], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Images to Download")
+        self.resize(880, 520)
+        self._entries = entries
+        self._lastClickedIndex: int | None = None
+
+        # Root horizontal layout splits preview (left) and list+controls (right)
+        root = QHBoxLayout(self)
+
+        # Preview area (scrollable for large images)
+        preview_container = QVBoxLayout()
+        self._dimensionLabel = QLabel("No preview")
+        self._dimensionLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        preview_container.addWidget(self._dimensionLabel)
+        self._previewLabel = QLabel("Select an item to preview", self)
+        self._previewLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._previewLabel.setFixedSize(320, 320)  # Cropping area size
+        preview_container.addWidget(self._previewLabel, 1)
+        root.addLayout(preview_container, 3)
+
+        # Right side vertical layout (list + controls + buttons)
+        rightLayout = QVBoxLayout()
+        rightLayout.addWidget(QLabel("Images found:"))
+        self._list = QListWidget(self)
+        self._list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        rightLayout.addWidget(self._list, 1)
+
+        # Populate list with checkable items
+        for e in entries:
+            url = e.get('url', '')
+            w = e.get('width', 0)
+            h = e.get('height', 0)
+            txt = f"[{w}x{h}] {url}"
+            item = QListWidgetItem(txt, self._list)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            small = (w and w < 64) or (h and h < 64) or 'icon' in url.lower() or 'favicon' in url.lower() or 'emoji' in url.lower()
+            item.setCheckState(Qt.CheckState.Unchecked if small else Qt.CheckState.Checked)
+
+        controls = QHBoxLayout()
+        self._btnUncheckSmall = QPushButton("Uncheck Small")
+        self._btnCheckAll = QPushButton("Check All")
+        self._btnInvert = QPushButton("Invert Selection")
+        controls.addWidget(self._btnUncheckSmall)
+        controls.addWidget(self._btnCheckAll)
+        controls.addWidget(self._btnInvert)
+        rightLayout.addLayout(controls)
+
+        from PyQt6.QtWidgets import QDialogButtonBox
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        rightLayout.addWidget(bb)
+
+        root.addLayout(rightLayout, 4)
+
+        # Button wiring
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        self._btnUncheckSmall.clicked.connect(self._uncheckSmall)
+        self._btnCheckAll.clicked.connect(self._checkAll)
+        self._btnInvert.clicked.connect(self._invert)
+        self._list.currentItemChanged.connect(self._previewSelected)
+        # itemClicked provides post-toggle state; we can apply shift-range logic here.
+        self._list.itemClicked.connect(self._onItemClicked)
+
+    def selectedUrls(self) -> list[str]:
+        out: list[str] = []
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                # Extract URL portion (after size prefix)
+                txt = item.text()
+                # Find first space after ]
+                pos = txt.find('] ')
+                url = txt[pos+2:] if pos != -1 else txt
+                out.append(url)
+        return out
+
+    def _uncheckSmall(self):
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if item.text().startswith('['):
+                size_part = item.text().split(']')[0][1:]
+                try:
+                    dims = size_part.split('x')
+                    w = int(dims[0])
+                    h = int(dims[1])
+                    if w < 128 or h < 128:
+                        item.setCheckState(Qt.CheckState.Unchecked)
+                except Exception:
+                    pass
+
+    def _checkAll(self):
+        for i in range(self._list.count()):
+            self._list.item(i).setCheckState(Qt.CheckState.Checked)
+
+    def _invert(self):
+        for i in range(self._list.count()):
+            itm = self._list.item(i)
+            itm.setCheckState(Qt.CheckState.Checked if itm.checkState() == Qt.CheckState.Unchecked else Qt.CheckState.Unchecked)
+
+    def _previewSelected(self, current: QListWidgetItem, previous: QListWidgetItem | None):  # type: ignore[name-defined]
+        if not current:
+            self._previewLabel.setText("Select an item to preview")
+            self._dimensionLabel.setText("No preview")
+            return
+        txt = current.text()
+        pos = txt.find('] ')
+        url = txt[pos+2:] if pos != -1 else txt
+        if url.startswith('data:image/'):
+            import re, base64
+            m = re.match(r'^data:image/(png|jpeg|jpg|webp|gif);base64,(.+)$', url, re.IGNORECASE)
+            if not m:
+                self._previewLabel.setText("Unsupported data URI")
+                self._dimensionLabel.setText("Unsupported")
+                return
+            ext, b64 = m.group(1), m.group(2)
+            try:
+                raw = base64.b64decode(b64)
+                from PyQt6.QtGui import QImage
+                img = QImage.fromData(raw)
+                if img.isNull():
+                    self._previewLabel.setText("Decode failed")
+                    self._dimensionLabel.setText("Decode failed")
+                    return
+                pm = QPixmap.fromImage(img)
+                self._setPreviewPixmap(pm)
+                return
+            except Exception:
+                self._previewLabel.setText("Decode error")
+                self._dimensionLabel.setText("Decode error")
+                return
+        # Network fetch (natural size) via short-lived worker thread
+        self._previewLabel.setText("Loading preview...")
+        self._dimensionLabel.setText("Loading...")
+        preview_worker = SingleImagePreviewWorker(url)
+        preview_thread = QThread(self)
+        preview_worker.moveToThread(preview_thread)
+        preview_worker.ready.connect(lambda pm: self._setPreviewPixmap(pm))
+        preview_worker.failed.connect(lambda err: (self._previewLabel.setText(err), self._dimensionLabel.setText(err)))
+        preview_thread.started.connect(preview_worker.run)
+        def cleanup():
+            preview_thread.quit(); preview_thread.wait(500); preview_worker.deleteLater(); preview_thread.deleteLater()
+        preview_worker.done.connect(cleanup)
+        preview_thread.start()
+
+    def _setPreviewPixmap(self, pm: QPixmap):
         if pm.isNull():
-            QMessageBox.warning(self, "Region", "Screenshot not loadable.")
+            self._previewLabel.setText("Invalid image")
+            self._dimensionLabel.setText("Invalid")
             return
-        # Region selection dialog
-        from PyQt6.QtWidgets import QDialog, QDialogButtonBox
-        class RegionSelector(QDialog):
-            def __init__(self, pixmap: QPixmap, parent=None):
-                super().__init__(parent)
-                self.setWindowTitle("Select Region")
-                self._pm = pixmap
-                self._origin = None
-                self._rect = None
-                self.label = QLabel(self)
-                self.label.setPixmap(pixmap)
-                layout = QVBoxLayout(self)
-                layout.addWidget(self.label)
-                buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-                buttons.accepted.connect(self.accept)
-                buttons.rejected.connect(self.reject)
-                layout.addWidget(buttons)
-                self.setMinimumSize(pixmap.width()+40, pixmap.height()+80)
-                self.label.installEventFilter(self)
-            def eventFilter(self, obj, event):
-                from PyQt6.QtCore import QEvent, QPoint
-                from PyQt6.QtGui import QPainter, QPen
-                if obj is self.label and event.type() in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseMove, QEvent.Type.MouseButtonRelease):
-                    if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
-                        self._origin = event.position().toPoint()
-                        self._rect = None
-                    elif event.type() == QEvent.Type.MouseMove and self._origin is not None:
-                        current = event.position().toPoint()
-                        x1, y1 = self._origin.x(), self._origin.y()
-                        x2, y2 = current.x(), current.y()
-                        self._rect = (min(x1,x2), min(y1,y2), abs(x2-x1), abs(y2-y1))
-                        # redraw with overlay
-                        pm_copy = self._pm.copy()
-                        painter = QPainter(pm_copy)
-                        painter.setPen(QPen(Qt.GlobalColor.red, 2, Qt.PenStyle.DashLine))
-                        if self._rect:
-                            painter.drawRect(*self._rect)
-                        painter.end()
-                        self.label.setPixmap(pm_copy)
-                    elif event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
-                        # Keep final rect overlay
-                        pass
-                    return True
-                return False
-            def selectedRegion(self):
-                return self._rect
-        dlg = RegionSelector(pm, self)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-        rect = dlg.selectedRegion()
-        if not rect:
-            QMessageBox.information(self, "Region", "No region selected.")
-            return
-        x, y, w, h = rect
-        cropped = pm.copy(x, y, w, h)
-        panel_id = f"sel_region_{len(self.panelGrid._cards)+1}"
-        self.panelGrid.addPanel(panel_id, cropped)
-        # OCR immediately
-        try:
-            from PIL import Image
-            from PyQt6.QtGui import QImage
-            qimg: QImage = cropped.toImage()
-            qimg = qimg.convertToFormat(QImage.Format.Format_RGBA8888)
-            ptr = qimg.bits()
-            ptr.setsize(qimg.height()*qimg.bytesPerLine())
-            pil = Image.frombytes("RGBA", (qimg.width(), qimg.height()), bytes(ptr))
-            from ..services.ocr.pytesseract_service import PyTesseractOCR  # type: ignore
-            ocr = PyTesseractOCR(cfg=None)
-            lines = ocr.extract_text(pil)
-            self.ocrCompleted.emit(panel_id, lines)
-        except Exception as e:
-            QMessageBox.warning(self, "OCR", f"Failed OCR: {e}")
+        # Crop to center if image is larger than preview area
+        area_w, area_h = self._previewLabel.width(), self._previewLabel.height()
+        img_w, img_h = pm.width(), pm.height()
+        if img_w > area_w or img_h > area_h:
+            # Center crop
+            left = max(0, (img_w - area_w) // 2)
+            top = max(0, (img_h - area_h) // 2)
+            cropped = pm.copy(left, top, min(area_w, img_w), min(area_h, img_h))
+            self._previewLabel.setPixmap(cropped)
+            self._dimensionLabel.setText(f"{img_w} x {img_h} px (cropped)")
+        else:
+            self._previewLabel.setPixmap(pm)
+            self._dimensionLabel.setText(f"{img_w} x {img_h} px")
 
-    def _onSeleniumScrapeImages(self):
-        svc = self._seleniumService()
-        if not svc.is_active():
-            QMessageBox.information(self, "Scrape", "Start Selenium first.")
-            return
-        try:
-            out_dir = os.path.join(os.getcwd(), "_selenium_scrape")
-            paths = svc.scrape_images(out_dir)
-            added = 0
-            for p in paths:
-                pm = QPixmap(p)
+    def _onItemClicked(self, item: QListWidgetItem):  # Shift-range checkbox logic
+        modifiers = QApplication.keyboardModifiers()
+        current_index = self._list.row(item)
+        if modifiers & Qt.KeyboardModifier.ShiftModifier and self._lastClickedIndex is not None:
+            start = min(self._lastClickedIndex, current_index)
+            end = max(self._lastClickedIndex, current_index)
+            target_state = item.checkState()
+            for i in range(start, end + 1):
+                it = self._list.item(i)
+                it.setCheckState(target_state)
+        self._lastClickedIndex = current_index
+
+
+class ImageDownloadWorker(QObject):
+    progress = pyqtSignal(int)            # current index
+    itemReady = pyqtSignal(str, QPixmap)  # panel_id, pixmap
+    finished = pyqtSignal(str, int, int, bool)  # status, added, errors, cancelled
+
+    def __init__(self, urls: list[str], out_dir: str, existing_count):
+        super().__init__()
+        self._urls = urls
+        self._out_dir = out_dir
+        self._cancel = False
+        self._existing_count_cb = existing_count
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):  # Slot executed in thread
+        import base64, re, requests, os
+        data_uri_re = re.compile(r'^data:image/(png|jpeg|jpg|webp|gif);base64,(.+)$', re.IGNORECASE)
+        added = 0
+        errors = 0
+        total = len(self._urls)
+        for idx, u in enumerate(self._urls, start=1):
+            if self._cancel:
+                break
+            try:
+                if self._cancel:
+                    break
+                m = data_uri_re.match(u)
+                if m:
+                    ext, b64 = m.group(1), m.group(2)
+                    raw = base64.b64decode(b64)
+                    fname = f"data_{self._existing_count_cb()+1}.{ 'jpg' if ext=='jpeg' else ext }"
+                    path = os.path.join(self._out_dir, fname)
+                    with open(path, 'wb') as f:
+                        f.write(raw)
+                else:
+                    resp = requests.get(u, timeout=15)
+                    if resp.status_code != 200 or not resp.content:
+                        errors += 1
+                        self.progress.emit(idx)
+                        continue
+                    tail = u.split('/')[-1].split('?')[0] or f"img_{self._existing_count_cb()+1}.bin"
+                    if '.' not in tail:
+                        tail += '.png'
+                    path = os.path.join(self._out_dir, tail)
+                    with open(path, 'wb') as f:
+                        f.write(resp.content)
+                pm = QPixmap(path)
                 if pm.isNull():
-                    continue
-                panel_id = f"scrape_{len(self.panelGrid._cards)+1}"
-                self.panelGrid.addPanel(panel_id, pm)
-                added += 1
-            QMessageBox.information(self, "Scrape", f"Imported {added} image(s) from page.")
+                    errors += 1
+                else:
+                    panel_id = f"scrape_{self._existing_count_cb()+1}"
+                    self.itemReady.emit(panel_id, pm)
+                    added += 1
+            except Exception:
+                errors += 1
+            self.progress.emit(idx)
+        status = "Cancelled" if self._cancel else "Completed"
+        self.finished.emit(status, added, errors, self._cancel)
+
+
+class SingleImagePreviewWorker(QObject):
+    ready = pyqtSignal(QPixmap)
+    failed = pyqtSignal(str)
+    done = pyqtSignal()
+
+    def __init__(self, url: str):
+        super().__init__()
+        self._url = url
+
+    def run(self):
+        try:
+            import requests
+            resp = requests.get(self._url, timeout=10)
+            if resp.status_code != 200 or not resp.content:
+                self.failed.emit("Fetch failed")
+            else:
+                pm = QPixmap()
+                pm.loadFromData(resp.content)
+                if pm.isNull():
+                    self.failed.emit("Decode failed")
+                else:
+                    self.ready.emit(pm)
         except Exception as e:
-            QMessageBox.warning(self, "Scrape", f"Failed scrape: {e}")
+            self.failed.emit(f"Error: {e}")
+        self.done.emit()
+
+    # (Selenium integration removed intentionally.)
 
 
 def create_app_window() -> MainWindow:

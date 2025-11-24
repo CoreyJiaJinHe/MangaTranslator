@@ -15,9 +15,10 @@ in a directory on PATH or alongside the Python executable.
 """
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Callable
 import os
 import time
+import threading
 import uuid
 import requests
 
@@ -63,10 +64,59 @@ class SeleniumPanelCapture:
                 self._driver = None
 
     # ---------------------- Navigation ----------------------
-    def navigate(self, url: str) -> None:
-        """Navigate the browser to a URL."""
+    def navigate(self, url: str, timeout: int = 8) -> None:
+        """Navigate the browser to a URL (blocking with timeout).
+
+        Raises
+        ------
+        TimeoutError
+            If page load exceeds timeout seconds.
+        """
         driver = self.ensure_driver()
-        driver.get(url)
+        result = {"done": False, "error": None}
+
+        def _do_get():
+            try:
+                driver.get(url)
+            except Exception as e:  # store error
+                result["error"] = e
+            finally:
+                result["done"] = True
+
+        t = threading.Thread(target=_do_get, daemon=True)
+        t.start()
+        t.join(timeout)
+        if not result["done"]:
+            # Attempt to stop loading
+            try:
+                driver.execute_script("window.stop();")
+            except Exception:
+                pass
+            raise TimeoutError(f"Navigation timed out after {timeout}s: {url}")
+        if result["error"] is not None:
+            raise result["error"]
+
+    def navigate_async(self, url: str, callback: Optional[Callable[[bool, Optional[Exception]], None]] = None, timeout: int = 8) -> None:
+        """Navigate without blocking UI; invoke callback when finished or timeout.
+
+        Parameters
+        ----------
+        url : str
+            Target URL.
+        callback : callable(success: bool, error: Exception|None)
+            Invoked on completion or timeout.
+        timeout : int
+            Seconds to wait before aborting.
+        """
+        def _run():
+            try:
+                self.navigate(url, timeout=timeout)
+                if callback:
+                    callback(True, None)
+            except Exception as e:
+                if callback:
+                    callback(False, e)
+        threading.Thread(target=_run, daemon=True).start()
 
     # ---------------------- Screenshot Capture ----------------------
     def screenshot_fullpage(self, output_dir: str) -> str:
