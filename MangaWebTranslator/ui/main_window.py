@@ -200,7 +200,11 @@ class MainWindow(QMainWindow):
         self.actExport = QAction("Export Text", self)
         self.actOpenUrl = QAction("Open URL", self)
         self.actCaptureWeb = QAction("Capture WebView", self)
-        self.actSelenium = QAction("Open Selenium", self)
+        self.actSeleniumStart = QAction("Selenium Start", self)
+        self.actSeleniumNav = QAction("Selenium Navigate", self)
+        self.actSeleniumScreenshot = QAction("Selenium Screenshot", self)
+        self.actSeleniumSelectRegion = QAction("Select Region (OCR)", self)
+        self.actSeleniumScrapeImages = QAction("Scrape Images", self)
 
     def _createToolbar(self):
         tb = QToolBar("Main")
@@ -212,7 +216,12 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         tb.addAction(self.actOpenUrl)
         tb.addAction(self.actCaptureWeb)
-        tb.addAction(self.actSelenium)
+        tb.addSeparator()
+        tb.addAction(self.actSeleniumStart)
+        tb.addAction(self.actSeleniumNav)
+        tb.addAction(self.actSeleniumScreenshot)
+        tb.addAction(self.actSeleniumSelectRegion)
+        tb.addAction(self.actSeleniumScrapeImages)
         self.addToolBar(tb)
 
     def _createLayout(self):
@@ -255,7 +264,11 @@ class MainWindow(QMainWindow):
         self.actExport.triggered.connect(self._onExport)
         self.actOpenUrl.triggered.connect(self._onOpenUrl)
         self.actCaptureWeb.triggered.connect(self._onCaptureWebView)
-        self.actSelenium.triggered.connect(self._onOpenSelenium)
+        self.actSeleniumStart.triggered.connect(self._onSeleniumStart)
+        self.actSeleniumNav.triggered.connect(self._onSeleniumNavigate)
+        self.actSeleniumScreenshot.triggered.connect(self._onSeleniumScreenshot)
+        self.actSeleniumSelectRegion.triggered.connect(self._onSeleniumSelectRegion)
+        self.actSeleniumScrapeImages.triggered.connect(self._onSeleniumScrapeImages)
 
         # Forward internal signals outward for future service integration.
         self.ocrCompleted.connect(self.sidePanel.setOcrBlocks)
@@ -352,28 +365,157 @@ class MainWindow(QMainWindow):
         self.panelGrid.addPanel(panel_id, pm)
         QMessageBox.information(self, "Capture", f"Captured web view as panel {panel_id}.")
 
-    def _onOpenSelenium(self):
-        # Stub: launches Selenium, grabs initial screenshot, import as panel.
+    # ----------------------- Selenium Interactive Workflow -----------------------
+    def _seleniumService(self):
+        # Lazy import to avoid hard dependency at import time.
+        from ..services.capture.selenium_capture import SeleniumPanelCapture  # type: ignore
+        if not hasattr(self, "_selenium_capture"):
+            self._selenium_capture = SeleniumPanelCapture()
+        return self._selenium_capture
+
+    def _onSeleniumStart(self):
         try:
-            from selenium import webdriver
-            from selenium.webdriver.chrome.options import Options
-            opts = Options()
-            opts.add_argument("--headless=new")
-            driver = webdriver.Chrome(options=opts)
-            driver.set_window_size(1280, 900)
-            driver.get("https://example.org")
-            screenshot_path = os.path.join(os.getcwd(), "_selenium_temp.png")
-            driver.save_screenshot(screenshot_path)
-            driver.quit()
-            pm = QPixmap(screenshot_path)
-            if not pm.isNull():
-                panel_id = f"selenium_{len(self.panelGrid._cards)+1}"
-                self.panelGrid.addPanel(panel_id, pm)
-                QMessageBox.information(self, "Selenium", f"Imported screenshot as panel {panel_id}.")
-            else:
-                QMessageBox.warning(self, "Selenium", "Screenshot invalid.")
+            svc = self._seleniumService()
+            svc.ensure_driver()
+            QMessageBox.information(self, "Selenium", "Started Firefox session.")
         except Exception as e:
-            QMessageBox.warning(self, "Selenium", f"Failed to launch Selenium stub: {e}")
+            QMessageBox.warning(self, "Selenium", f"Failed to start Selenium: {e}")
+
+    def _onSeleniumNavigate(self):
+        from PyQt6.QtWidgets import QInputDialog
+        svc = self._seleniumService()
+        if not svc.is_active():
+            QMessageBox.information(self, "Selenium", "Start Selenium first.")
+            return
+        url, ok = QInputDialog.getText(self, "Navigate", "Enter URL:", text="https://")
+        if not ok or not url.strip():
+            return
+        try:
+            svc.navigate(url.strip())
+            QMessageBox.information(self, "Selenium", f"Navigated to {url.strip()}")
+        except Exception as e:
+            QMessageBox.warning(self, "Selenium", f"Navigation failed: {e}")
+
+    def _onSeleniumScreenshot(self):
+        svc = self._seleniumService()
+        if not svc.is_active():
+            QMessageBox.information(self, "Selenium", "Start Selenium first.")
+            return
+        try:
+            out_dir = os.path.join(os.getcwd(), "_selenium_shots")
+            path = svc.screenshot_fullpage(out_dir)
+            pm = QPixmap(path)
+            if pm.isNull():
+                QMessageBox.warning(self, "Screenshot", "Screenshot invalid.")
+                return
+            # Store screenshot pixmap for region selection.
+            self._last_screenshot_path = path
+            QMessageBox.information(self, "Screenshot", f"Saved screenshot: {os.path.basename(path)}")
+        except Exception as e:
+            QMessageBox.warning(self, "Screenshot", f"Failed: {e}")
+
+    def _onSeleniumSelectRegion(self):
+        # Requires a prior screenshot
+        path = getattr(self, "_last_screenshot_path", None)
+        if not path or not os.path.isfile(path):
+            QMessageBox.information(self, "Region", "Capture a screenshot first.")
+            return
+        pm = QPixmap(path)
+        if pm.isNull():
+            QMessageBox.warning(self, "Region", "Screenshot not loadable.")
+            return
+        # Region selection dialog
+        from PyQt6.QtWidgets import QDialog, QDialogButtonBox
+        class RegionSelector(QDialog):
+            def __init__(self, pixmap: QPixmap, parent=None):
+                super().__init__(parent)
+                self.setWindowTitle("Select Region")
+                self._pm = pixmap
+                self._origin = None
+                self._rect = None
+                self.label = QLabel(self)
+                self.label.setPixmap(pixmap)
+                layout = QVBoxLayout(self)
+                layout.addWidget(self.label)
+                buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+                buttons.accepted.connect(self.accept)
+                buttons.rejected.connect(self.reject)
+                layout.addWidget(buttons)
+                self.setMinimumSize(pixmap.width()+40, pixmap.height()+80)
+                self.label.installEventFilter(self)
+            def eventFilter(self, obj, event):
+                from PyQt6.QtCore import QEvent, QPoint
+                from PyQt6.QtGui import QPainter, QPen
+                if obj is self.label and event.type() in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseMove, QEvent.Type.MouseButtonRelease):
+                    if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                        self._origin = event.position().toPoint()
+                        self._rect = None
+                    elif event.type() == QEvent.Type.MouseMove and self._origin is not None:
+                        current = event.position().toPoint()
+                        x1, y1 = self._origin.x(), self._origin.y()
+                        x2, y2 = current.x(), current.y()
+                        self._rect = (min(x1,x2), min(y1,y2), abs(x2-x1), abs(y2-y1))
+                        # redraw with overlay
+                        pm_copy = self._pm.copy()
+                        painter = QPainter(pm_copy)
+                        painter.setPen(QPen(Qt.GlobalColor.red, 2, Qt.PenStyle.DashLine))
+                        if self._rect:
+                            painter.drawRect(*self._rect)
+                        painter.end()
+                        self.label.setPixmap(pm_copy)
+                    elif event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+                        # Keep final rect overlay
+                        pass
+                    return True
+                return False
+            def selectedRegion(self):
+                return self._rect
+        dlg = RegionSelector(pm, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        rect = dlg.selectedRegion()
+        if not rect:
+            QMessageBox.information(self, "Region", "No region selected.")
+            return
+        x, y, w, h = rect
+        cropped = pm.copy(x, y, w, h)
+        panel_id = f"sel_region_{len(self.panelGrid._cards)+1}"
+        self.panelGrid.addPanel(panel_id, cropped)
+        # OCR immediately
+        try:
+            from PIL import Image
+            from PyQt6.QtGui import QImage
+            qimg: QImage = cropped.toImage()
+            qimg = qimg.convertToFormat(QImage.Format.Format_RGBA8888)
+            ptr = qimg.bits()
+            ptr.setsize(qimg.height()*qimg.bytesPerLine())
+            pil = Image.frombytes("RGBA", (qimg.width(), qimg.height()), bytes(ptr))
+            from ..services.ocr.pytesseract_service import PyTesseractOCR  # type: ignore
+            ocr = PyTesseractOCR(cfg=None)
+            lines = ocr.extract_text(pil)
+            self.ocrCompleted.emit(panel_id, lines)
+        except Exception as e:
+            QMessageBox.warning(self, "OCR", f"Failed OCR: {e}")
+
+    def _onSeleniumScrapeImages(self):
+        svc = self._seleniumService()
+        if not svc.is_active():
+            QMessageBox.information(self, "Scrape", "Start Selenium first.")
+            return
+        try:
+            out_dir = os.path.join(os.getcwd(), "_selenium_scrape")
+            paths = svc.scrape_images(out_dir)
+            added = 0
+            for p in paths:
+                pm = QPixmap(p)
+                if pm.isNull():
+                    continue
+                panel_id = f"scrape_{len(self.panelGrid._cards)+1}"
+                self.panelGrid.addPanel(panel_id, pm)
+                added += 1
+            QMessageBox.information(self, "Scrape", f"Imported {added} image(s) from page.")
+        except Exception as e:
+            QMessageBox.warning(self, "Scrape", f"Failed scrape: {e}")
 
 
 def create_app_window() -> MainWindow:
