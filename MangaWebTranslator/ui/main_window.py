@@ -11,8 +11,9 @@ from __future__ import annotations
 from typing import List, Optional
 import os
 
-from PyQt6.QtCore import Qt, pyqtSignal, QSize, QThread, QObject
+from PyQt6.QtCore import Qt, pyqtSignal, QSize, QThread, QObject, QUrl, QTimer
 from PyQt6.QtGui import QAction, QPixmap
+from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 from PyQt6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -241,6 +242,12 @@ class MainWindow(QMainWindow):
             from PyQt6.QtWidgets import QLineEdit, QPushButton
             self.addressBar = QLineEdit(self._stack)
             self.addressBar.setPlaceholderText("Enter URL and press Go")
+            import os
+            from dotenv import load_dotenv
+            load_dotenv()
+            default_url = os.getenv("DEFAULT_MANGA_URL")
+            self.addressBar.setText(default_url)
+
             self.goBtn = QPushButton("Go", self._stack)
             addr_row.addWidget(self.addressBar, 1)
             addr_row.addWidget(self.goBtn)
@@ -477,10 +484,10 @@ class MainWindow(QMainWindow):
         progressDlg.setWindowModality(Qt.WindowModality.ApplicationModal)
         progressDlg.show()
 
-        # Worker object
-        worker = ImageDownloadWorker(urls=urls, out_dir=out_dir, existing_count=lambda: len(self.panelGrid._cards))
-        thread = QThread(self)
-        worker.moveToThread(thread)
+        # Async worker object (no QThread)
+        worker = AsyncImageDownloadWorker(urls=urls, out_dir=out_dir, existing_count=lambda: len(self.panelGrid._cards))
+        # keep a reference on self so it isn't GC'd while running
+        self._activeDownloadWorker = worker
 
         # Wiring
         worker.progress.connect(lambda idx: progressDlg.setValue(idx))
@@ -488,23 +495,24 @@ class MainWindow(QMainWindow):
         def done(status: str, added: int, errors: int, cancelled: bool):
             progressDlg.close()
             QMessageBox.information(self, "Download", f"{status}. Added {added} image(s). Errors: {errors}")
-            thread.quit()
-            thread.wait(2000)
-            worker.deleteLater()
-            thread.deleteLater()
+            try:
+                worker.deleteLater()
+            except Exception:
+                pass
+            self._activeDownloadWorker = None
         worker.finished.connect(done)
 
         def request_cancel():
             worker.cancel()
         progressDlg.canceled.connect(request_cancel)
 
-        thread.started.connect(worker.run)
-        thread.start()
+        # start the sequential async download
+        worker.start()
 
         # If dialog closed via X while running, treat as cancel.
         def on_close():
-            if thread.isRunning():
-                worker.cancel()
+            if getattr(self, '_activeDownloadWorker', None) is not None:
+                self._activeDownloadWorker.cancel()
         progressDlg.finished.connect(on_close)
 
 
@@ -524,6 +532,8 @@ class ImageSelectionDialog(QDialog):  # type: ignore[name-defined]
         self.resize(880, 520)
         self._entries = entries
         self._lastClickedIndex: int | None = None
+        # legacy per-preview thread lists removed; using AsyncImagePreviewer
+
 
         # Root horizontal layout splits preview (left) and list+controls (right)
         root = QHBoxLayout(self)
@@ -535,7 +545,7 @@ class ImageSelectionDialog(QDialog):  # type: ignore[name-defined]
         preview_container.addWidget(self._dimensionLabel)
         self._previewLabel = QLabel("Select an item to preview", self)
         self._previewLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._previewLabel.setFixedSize(320, 320)  # Cropping area size
+        self._previewLabel.setFixedSize(320, 320)  # Preview area size
         preview_container.addWidget(self._previewLabel, 1)
         root.addLayout(preview_container, 3)
 
@@ -581,7 +591,21 @@ class ImageSelectionDialog(QDialog):  # type: ignore[name-defined]
         self._list.currentItemChanged.connect(self._previewSelected)
         # itemClicked provides post-toggle state; we can apply shift-range logic here.
         self._list.itemClicked.connect(self._onItemClicked)
-
+        # Async previewer (uses Qt networking; cancellable, no extra threads)
+        self._previewer = AsyncImagePreviewer(self)
+        self._previewer.ready.connect(self._setPreviewPixmap)
+        self._previewer.failed.connect(self._setPreviewError)
+    def closeEvent(self, event):
+        """
+        Ensure all preview threads and workers are stopped and deleted when the dialog closes.
+        Prevents memory leaks and orphaned threads.
+        """
+        # Abort any active async preview request
+        try:
+            self._previewer.abort()
+        except Exception:
+            pass
+        super().closeEvent(event)
     def selectedUrls(self) -> list[str]:
         out: list[str] = []
         for i in range(self._list.count()):
@@ -619,6 +643,7 @@ class ImageSelectionDialog(QDialog):  # type: ignore[name-defined]
             itm.setCheckState(Qt.CheckState.Checked if itm.checkState() == Qt.CheckState.Unchecked else Qt.CheckState.Unchecked)
 
     def _previewSelected(self, current: QListWidgetItem, previous: QListWidgetItem | None):  # type: ignore[name-defined]
+        # Using AsyncImagePreviewer; no legacy QThread workers to clean up here.
         if not current:
             self._previewLabel.setText("Select an item to preview")
             self._dimensionLabel.setText("No preview")
@@ -652,35 +677,28 @@ class ImageSelectionDialog(QDialog):  # type: ignore[name-defined]
         # Network fetch (natural size) via short-lived worker thread
         self._previewLabel.setText("Loading preview...")
         self._dimensionLabel.setText("Loading...")
-        preview_worker = SingleImagePreviewWorker(url)
-        preview_thread = QThread(self)
-        preview_worker.moveToThread(preview_thread)
-        preview_worker.ready.connect(lambda pm: self._setPreviewPixmap(pm))
-        preview_worker.failed.connect(lambda err: (self._previewLabel.setText(err), self._dimensionLabel.setText(err)))
-        preview_thread.started.connect(preview_worker.run)
-        def cleanup():
-            preview_thread.quit(); preview_thread.wait(500); preview_worker.deleteLater(); preview_thread.deleteLater()
-        preview_worker.done.connect(cleanup)
-        preview_thread.start()
+        # Use AsyncImagePreviewer (no extra threads). It will abort any in-flight request.
+        self._previewer.fetch(url)
 
     def _setPreviewPixmap(self, pm: QPixmap):
         if pm.isNull():
             self._previewLabel.setText("Invalid image")
             self._dimensionLabel.setText("Invalid")
             return
-        # Crop to center if image is larger than preview area
         area_w, area_h = self._previewLabel.width(), self._previewLabel.height()
         img_w, img_h = pm.width(), pm.height()
-        if img_w > area_w or img_h > area_h:
-            # Center crop
-            left = max(0, (img_w - area_w) // 2)
-            top = max(0, (img_h - area_h) // 2)
-            cropped = pm.copy(left, top, min(area_w, img_w), min(area_h, img_h))
-            self._previewLabel.setPixmap(cropped)
-            self._dimensionLabel.setText(f"{img_w} x {img_h} px (cropped)")
-        else:
-            self._previewLabel.setPixmap(pm)
-            self._dimensionLabel.setText(f"{img_w} x {img_h} px")
+        # Resize to fit area, keeping aspect ratio
+        scaled = pm.scaled(area_w, area_h, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        self._previewLabel.setPixmap(scaled)
+        self._dimensionLabel.setText(f"{img_w} x {img_h} px (scaled)")
+
+    def _setPreviewError(self, err: str):
+        # Centralized preview error handling for async previewer
+        try:
+            self._previewLabel.setText(err)
+            self._dimensionLabel.setText(err)
+        except Exception:
+            pass
 
     def _onItemClicked(self, item: QListWidgetItem):  # Shift-range checkbox logic
         modifiers = QApplication.keyboardModifiers()
@@ -695,94 +713,222 @@ class ImageSelectionDialog(QDialog):  # type: ignore[name-defined]
         self._lastClickedIndex = current_index
 
 
-class ImageDownloadWorker(QObject):
+class AsyncImageDownloadWorker(QObject):
+    """Asynchronous sequential image downloader using QNetworkAccessManager.
+
+    Downloads images one-by-one (keeps ordering) and emits progress, itemReady and finished.
+    Supports `cancel()` which aborts the current in-flight request.
+    """
     progress = pyqtSignal(int)            # current index
     itemReady = pyqtSignal(str, QPixmap)  # panel_id, pixmap
     finished = pyqtSignal(str, int, int, bool)  # status, added, errors, cancelled
 
     def __init__(self, urls: list[str], out_dir: str, existing_count):
         super().__init__()
+        import re
         self._urls = urls
         self._out_dir = out_dir
         self._cancel = False
         self._existing_count_cb = existing_count
+        self._manager = QNetworkAccessManager(self)
+        self._currentReply: QNetworkReply | None = None
+        self._index = 0
+        self._added = 0
+        self._errors = 0
+        self._data_uri_re = re.compile(r'^data:image/(png|jpeg|jpg|webp|gif);base64,(.+)$', re.IGNORECASE)
+
+    def start(self):
+        self._cancel = False
+        self._index = 0
+        self._added = 0
+        self._errors = 0
+        QTimer.singleShot(0, self._start_next)
 
     def cancel(self):
         self._cancel = True
-
-    def run(self):  # Slot executed in thread
-        import base64, re, requests, os
-        data_uri_re = re.compile(r'^data:image/(png|jpeg|jpg|webp|gif);base64,(.+)$', re.IGNORECASE)
-        added = 0
-        errors = 0
-        total = len(self._urls)
-        for idx, u in enumerate(self._urls, start=1):
-            if self._cancel:
-                break
+        if self._currentReply is not None:
             try:
-                if self._cancel:
-                    break
-                m = data_uri_re.match(u)
-                if m:
-                    ext, b64 = m.group(1), m.group(2)
-                    raw = base64.b64decode(b64)
-                    fname = f"data_{self._existing_count_cb()+1}.{ 'jpg' if ext=='jpeg' else ext }"
-                    path = os.path.join(self._out_dir, fname)
-                    with open(path, 'wb') as f:
-                        f.write(raw)
-                else:
-                    resp = requests.get(u, timeout=15)
-                    if resp.status_code != 200 or not resp.content:
-                        errors += 1
-                        self.progress.emit(idx)
-                        continue
-                    tail = u.split('/')[-1].split('?')[0] or f"img_{self._existing_count_cb()+1}.bin"
-                    if '.' not in tail:
-                        tail += '.png'
-                    path = os.path.join(self._out_dir, tail)
-                    with open(path, 'wb') as f:
-                        f.write(resp.content)
+                self._currentReply.abort()
+            except Exception:
+                pass
+            try:
+                self._currentReply.deleteLater()
+            except Exception:
+                pass
+            self._currentReply = None
+
+    def _start_next(self):
+        if self._cancel:
+            status = "Cancelled"
+            self.finished.emit(status, self._added, self._errors, True)
+            return
+        if self._index >= len(self._urls):
+            status = "Completed"
+            self.finished.emit(status, self._added, self._errors, False)
+            return
+
+        u = self._urls[self._index]
+        idx = self._index + 1
+
+        # Data URI case
+        m = self._data_uri_re.match(u)
+        if m:
+            import base64, os
+            try:
+                ext, b64 = m.group(1), m.group(2)
+                raw = base64.b64decode(b64)
+                fname = f"data_{self._existing_count_cb()+1}.{ 'jpg' if ext=='jpeg' else ext }"
+                path = os.path.join(self._out_dir, fname)
+                with open(path, 'wb') as f:
+                    f.write(raw)
                 pm = QPixmap(path)
                 if pm.isNull():
-                    errors += 1
+                    self._errors += 1
                 else:
                     panel_id = f"scrape_{self._existing_count_cb()+1}"
                     self.itemReady.emit(panel_id, pm)
-                    added += 1
+                    self._added += 1
             except Exception:
-                errors += 1
+                self._errors += 1
             self.progress.emit(idx)
-        status = "Cancelled" if self._cancel else "Completed"
-        self.finished.emit(status, added, errors, self._cancel)
+            self._index += 1
+            QTimer.singleShot(0, self._start_next)
+            return
+
+        # Network download
+        req = QNetworkRequest(QUrl(u))
+        reply = self._manager.get(req)
+        self._currentReply = reply
+        reply.finished.connect(lambda: self._on_reply_finished(reply))
+        reply.errorOccurred.connect(lambda err: self._on_reply_error(reply, err))
+
+    def _on_reply_error(self, reply: QNetworkReply, err):
+        self._errors += 1
+        idx = self._index + 1
+        self.progress.emit(idx)
+        try:
+            reply.deleteLater()
+        except Exception:
+            pass
+        self._currentReply = None
+        self._index += 1
+        QTimer.singleShot(0, self._start_next)
+
+    def _on_reply_finished(self, reply: QNetworkReply):
+        if reply.error() != QNetworkReply.NetworkError.NoError:
+            return self._on_reply_error(reply, reply.error())
+        try:
+            data = bytes(reply.readAll())
+            import os
+            url_path = reply.url().path() or ''
+            tail = url_path.split('/')[-1].split('?')[0] or f"img_{self._existing_count_cb()+1}.bin"
+            if '.' not in tail:
+                tail += '.png'
+            path = os.path.join(self._out_dir, tail)
+            with open(path, 'wb') as f:
+                f.write(data)
+            pm = QPixmap(path)
+            if pm.isNull():
+                self._errors += 1
+            else:
+                panel_id = f"scrape_{self._existing_count_cb()+1}"
+                self.itemReady.emit(panel_id, pm)
+                self._added += 1
+        except Exception:
+            self._errors += 1
+        idx = self._index + 1
+        self.progress.emit(idx)
+        try:
+            reply.deleteLater()
+        except Exception:
+            pass
+        self._currentReply = None
+        self._index += 1
+        QTimer.singleShot(0, self._start_next)
 
 
-class SingleImagePreviewWorker(QObject):
+# Legacy blocking preview worker removed; AsyncImagePreviewer is used instead.
+
+
+class AsyncImagePreviewer(QObject):
+    """Asynchronous image fetcher using QNetworkAccessManager.
+
+    - `fetch(url)` starts a new request, aborting any active request.
+    - Emits `ready(QPixmap)` on success, `failed(str)` on error.
+    - No extra QThread required — runs on the Qt event loop.
+    """
     ready = pyqtSignal(QPixmap)
     failed = pyqtSignal(str)
-    done = pyqtSignal()
+    finished = pyqtSignal()
 
-    def __init__(self, url: str):
-        super().__init__()
-        self._url = url
+    def __init__(self, parent: Optional[QObject] = None):
+        super().__init__(parent)
+        self._manager = QNetworkAccessManager(self)
+        self._currentReply: QNetworkReply | None = None
 
-    def run(self):
+    def fetch(self, url: str):
+        # Abort any in-flight request
+        if self._currentReply is not None:
+            try:
+                self._currentReply.abort()
+            except Exception:
+                pass
+            self._currentReply.deleteLater()
+            self._currentReply = None
+
+        req = QNetworkRequest(QUrl(url))
+        reply = self._manager.get(req)
+        self._currentReply = reply
+
+        # Bind handlers
+        reply.finished.connect(lambda: self._onFinished(reply))
+        reply.errorOccurred.connect(lambda err: self._onError(reply, err))
+
+    def abort(self):
+        if self._currentReply is not None:
+            try:
+                self._currentReply.abort()
+            except Exception:
+                pass
+            self._currentReply.deleteLater()
+            self._currentReply = None
+
+    def _onError(self, reply: QNetworkReply, err):
         try:
-            import requests
-            resp = requests.get(self._url, timeout=10)
-            if resp.status_code != 200 or not resp.content:
-                self.failed.emit("Fetch failed")
-            else:
-                pm = QPixmap()
-                pm.loadFromData(resp.content)
-                if pm.isNull():
-                    self.failed.emit("Decode failed")
-                else:
-                    self.ready.emit(pm)
-        except Exception as e:
-            self.failed.emit(f"Error: {e}")
-        self.done.emit()
+            errstr = reply.errorString() if hasattr(reply, 'errorString') else str(err)
+        except Exception:
+            errstr = str(err)
+        self.failed.emit(errstr)
+        try:
+            reply.deleteLater()
+        except Exception:
+            pass
+        if self._currentReply is reply:
+            self._currentReply = None
+        self.finished.emit()
 
-    # (Selenium integration removed intentionally.)
+    def _onFinished(self, reply: QNetworkReply):
+        # If the reply reports an error, route to error handler.
+        if reply.error() != QNetworkReply.NetworkError.NoError:
+            self._onError(reply, reply.error())
+            return
+        try:
+            data = bytes(reply.readAll())
+            pm = QPixmap()
+            ok = pm.loadFromData(data)
+            if not ok or pm.isNull():
+                self.failed.emit("Invalid image data")
+            else:
+                self.ready.emit(pm)
+        except Exception as e:
+            self.failed.emit(f"Decode error: {e}")
+        try:
+            reply.deleteLater()
+        except Exception:
+            pass
+        if self._currentReply is reply:
+            self._currentReply = None
+        self.finished.emit()
 
 
 def create_app_window() -> MainWindow:

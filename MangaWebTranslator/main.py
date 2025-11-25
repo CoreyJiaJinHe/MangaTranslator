@@ -1,13 +1,14 @@
-"""Application entry point launching the prototype PyQt6 UI.
+# """Application entry point launching the prototype PyQt6 UI.
 
-Future enhancement steps (after phased approvals):
-  - Configuration loading
-  - Service wiring (OCR, translation, dictionary, similarity)
-  - Persistent workspace handling
-  - Graceful shutdown / resource cleanup
-"""
+# Future enhancement steps (after phased approvals):
+#   - Configuration loading
+#   - Service wiring (OCR, translation, dictionary, similarity)
+#   - Persistent workspace handling
+#   - Graceful shutdown / resource cleanup
+# """
 from __future__ import annotations
 
+from ui.main_window import create_app_window
 import sys
 
 try:
@@ -27,7 +28,6 @@ try:  # pragma: no cover - environment dependent
 except Exception:
     pass
 
-from ui.main_window import create_app_window
 
 
 def main() -> None:
