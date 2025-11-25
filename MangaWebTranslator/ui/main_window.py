@@ -12,7 +12,7 @@ from typing import List, Optional
 import os
 
 from PyQt6.QtCore import Qt, pyqtSignal, QSize, QThread, QObject, QUrl, QTimer
-from PyQt6.QtGui import QAction, QPixmap
+from PyQt6.QtGui import QAction, QPixmap, QIcon
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 from PyQt6.QtWidgets import (
     QMainWindow,
@@ -89,6 +89,117 @@ class PanelGrid(QScrollArea):
         self._cards.append(card)
 
 
+class PanelsView(QWidget):
+    """Vertical list of panels on the left and a larger preview on the right.
+
+    Keeps a `_cards` list of panel ids for compatibility with existing code.
+    Provides `addPanel(panel_id, pixmap)` and emits `panelSelected(str)`.
+    """
+    panelSelected = pyqtSignal(str)
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        # Left: list of thumbnails (scrollable by QListWidget)
+        self.listWidget = QListWidget(self)
+        self.listWidget.setIconSize(QSize(140, 140))
+        self.listWidget.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.listWidget.setViewMode(QListWidget.ViewMode.ListMode)
+        self.listWidget.setMovement(QListWidget.Movement.Static)
+        # Allow multi-selection for batch operations
+        self.listWidget.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
+        self.listWidget.setMinimumWidth(180)
+        # Icon-only appearance
+        self.listWidget.setSpacing(6)
+        self.listWidget.setUniformItemSizes(True)
+        self.listWidget.setWordWrap(False)
+        self.listWidget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.listWidget.customContextMenuRequested.connect(self._onContextMenu)
+
+        # Right: preview area
+        previewContainer = QVBoxLayout()
+        self.previewLabel = QLabel("Select a panel to preview")
+        self.previewLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.previewLabel.setMinimumSize(480, 520)
+        previewContainer.addWidget(self.previewLabel, 1)
+
+        layout.addWidget(self.listWidget, 0)
+        layout.addLayout(previewContainer, 1)
+
+        self._cards: List[str] = []
+        self._pixmaps: dict[str, QPixmap] = {}
+
+        self.listWidget.itemClicked.connect(self._onItemClicked)
+
+    def addPanel(self, panel_id: str, pixmap: QPixmap):
+        # Create thumbnail icon
+        thumb = pixmap.scaled(QSize(140, 140), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        icon = QIcon(thumb)
+        # Show text label under thumbnail (panel id) for clarity
+        item = QListWidgetItem(icon, panel_id, self.listWidget)
+        item.setData(Qt.ItemDataRole.UserRole, panel_id)
+        # Ensure items have a consistent size to show icon + label
+        try:
+            item.setSizeHint(QSize(160, 160))
+        except Exception:
+            pass
+        self._cards.append(panel_id)
+        self._pixmaps[panel_id] = pixmap
+        # Auto-select newly added and show preview immediately (add to selection)
+        item.setSelected(True)
+        self._onItemClicked(item)
+
+    def selectedPanelIds(self) -> list[str]:
+        ids: list[str] = []
+        for it in self.listWidget.selectedItems():
+            pid = it.data(Qt.ItemDataRole.UserRole) or it.text()
+            ids.append(pid)
+        return ids
+
+    def allVisiblePanelIds(self) -> list[str]:
+        ids: list[str] = []
+        for i in range(self.listWidget.count()):
+            it = self.listWidget.item(i)
+            pid = it.data(Qt.ItemDataRole.UserRole) or it.text()
+            ids.append(pid)
+        return ids
+
+    def removeSelectedPanels(self):
+        sel = list(self.listWidget.selectedItems())
+        for it in sel:
+            pid = it.data(Qt.ItemDataRole.UserRole) or it.text()
+            try:
+                self._cards.remove(pid)
+            except Exception:
+                pass
+            try:
+                del self._pixmaps[pid]
+            except Exception:
+                pass
+            row = self.listWidget.row(it)
+            self.listWidget.takeItem(row)
+
+    def _onContextMenu(self, pos):
+        item = self.listWidget.itemAt(pos)
+        if not item:
+            return
+        from PyQt6.QtWidgets import QMenu
+        menu = QMenu(self)
+        rem = menu.addAction("Remove")
+        act = menu.exec(self.listWidget.mapToGlobal(pos))
+        if act is rem:
+            self.removeSelectedPanels()
+
+    def _onItemClicked(self, item: QListWidgetItem):
+        panel_id = item.data(Qt.ItemDataRole.UserRole) or item.text()
+        pm = self._pixmaps.get(panel_id)
+        if pm:
+            area_w, area_h = self.previewLabel.width(), self.previewLabel.height()
+            scaled = pm.scaled(area_w, area_h, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            self.previewLabel.setPixmap(scaled)
+        self.panelSelected.emit(panel_id)
+
+
 class SidePanel(QWidget):
     """Right-side detail pane showing OCR text blocks and translations."""
     requestOcr = pyqtSignal(str)
@@ -138,7 +249,10 @@ class SidePanel(QWidget):
 
     def setPanel(self, panel_id: str):
         self.current_panel = panel_id
-        self.title.setText(f"Panel: {panel_id}")
+        if panel_id:
+            self.title.setText(f"Panel: {panel_id}")
+        else:
+            self.title.setText("No panel selected")
         self.blocksList.clear()
         self.translationEdit.clear()
         self.dictEdit.clear()
@@ -201,6 +315,9 @@ class MainWindow(QMainWindow):
         self.actExport = QAction("Export Text", self)
         self.actOpenUrl = QAction("Open URL", self)
         self.actCaptureWeb = QAction("Capture WebView", self)
+        self.actShowPanels = QAction("Show Panels", self)
+        self.actShowBrowser = QAction("Show Browser", self)
+        self.actRemovePanel = QAction("Remove Panel", self)
         # Removed Selenium-related actions; embedded browser now primary.
         self.actScrapeImages = QAction("Scrape Images", self)
 
@@ -214,6 +331,9 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         tb.addAction(self.actOpenUrl)
         tb.addAction(self.actCaptureWeb)
+        tb.addAction(self.actShowPanels)
+        tb.addAction(self.actShowBrowser)
+        tb.addAction(self.actRemovePanel)
         tb.addAction(self.actScrapeImages)
         self.addToolBar(tb)
 
@@ -222,7 +342,8 @@ class MainWindow(QMainWindow):
         self._stack = QWidget(self)
         stack_layout = QVBoxLayout(self._stack)
         stack_layout.setContentsMargins(0, 0, 0, 0)
-        self.panelGrid = PanelGrid(self._stack)
+        # PanelsView presents a vertical list of thumbnails + larger preview
+        self.panelGrid = PanelsView(self._stack)
         # Web view (conditional import)
         try:
             from PyQt6.QtWebEngineWidgets import QWebEngineView  # type: ignore
@@ -306,6 +427,9 @@ class MainWindow(QMainWindow):
         self.actExport.triggered.connect(self._onExport)
         self.actOpenUrl.triggered.connect(self._onOpenUrl)
         self.actCaptureWeb.triggered.connect(self._onCaptureWebView)
+        self.actShowPanels.triggered.connect(self._onShowPanels)
+        self.actShowBrowser.triggered.connect(self._onShowBrowser)
+        self.actRemovePanel.triggered.connect(self._onRemovePanel)
         self.actScrapeImages.triggered.connect(self._onScrapeImages)
 
         # Forward internal signals outward for future service integration.
@@ -340,14 +464,63 @@ class MainWindow(QMainWindow):
         self.translationCompleted.emit(panel_id, translated)
 
     def _onOcrAll(self):
-        # Iterate all panels and emit dummy OCR results.
-        for card in self.panelGrid._cards:
-            self.ocrCompleted.emit(card.panel_id, ["全体OCR", "ダミー"])
+        # Run OCR on selected panels if any, otherwise on all visible panels.
+        ids: list[str]
+        if hasattr(self.panelGrid, 'selectedPanelIds'):
+            sel = self.panelGrid.selectedPanelIds()
+            ids = sel if sel else self.panelGrid.allVisiblePanelIds()
+        else:
+            # fallback for legacy PanelGrid
+            ids = [getattr(card, 'panel_id', str(card)) for card in self.panelGrid._cards]
+
+        total = len(ids)
+        if total == 0:
+            QMessageBox.information(self, "OCR", "No panels to OCR.")
+            return
+        from PyQt6.QtWidgets import QProgressDialog
+        progress = QProgressDialog("Running OCR...", "Cancel", 0, total, self)
+        progress.setWindowTitle("OCR Panels")
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.show()
+        done = 0
+        for i, pid in enumerate(ids):
+            if progress.wasCanceled():
+                break
+            # Placeholder OCR result
+            self.ocrCompleted.emit(pid, ["全体OCR", "ダミー"])
+            done += 1
+            progress.setValue(done)
+            QApplication.processEvents()
+        progress.close()
+        QMessageBox.information(self, "OCR", f"Processed {done} / {total} panels.")
 
     def _onTranslateSelected(self):
-        if not self.sidePanel.current_panel:
-            return
-        self._onRequestTranslate(self.sidePanel.current_panel)
+        # If panels are selected in the panels view, translate those; otherwise translate the current panel.
+        ids: list[str] = []
+        if hasattr(self.panelGrid, 'selectedPanelIds'):
+            ids = self.panelGrid.selectedPanelIds()
+        if ids:
+            total = len(ids)
+            from PyQt6.QtWidgets import QProgressDialog
+            progress = QProgressDialog("Translating panels...", "Cancel", 0, total, self)
+            progress.setWindowTitle("Translate Panels")
+            progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+            progress.show()
+            done = 0
+            for pid in ids:
+                if progress.wasCanceled():
+                    break
+                self._onRequestTranslate(pid)
+                done += 1
+                progress.setValue(done)
+                QApplication.processEvents()
+            progress.close()
+            QMessageBox.information(self, "Translate", f"Translated {done} / {total} panels.")
+        else:
+            if not self.sidePanel.current_panel:
+                QMessageBox.information(self, "Translate", "No panel selected to translate.")
+                return
+            self._onRequestTranslate(self.sidePanel.current_panel)
 
     def _onExport(self):
         # Placeholder: aggregate text blocks + translation.
@@ -414,9 +587,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Capture", "Failed to grab web view.")
             return
         panel_id = f"web_{len(self.panelGrid._cards)+1}"
-        self._ensureGridVisible()
+        # Add captured image to panels but KEEP the browser visible so user can continue navigating.
         self.panelGrid.addPanel(panel_id, pm)
-        QMessageBox.information(self, "Capture", f"Captured web view as panel {panel_id}.")
+        QMessageBox.information(self, "Capture", f"Captured web view as panel {panel_id}. Use 'Show Panels' to view panels.")
 
     def _onScrapeImages(self):
         """Extract image sources from the currently loaded page and import them as panels.
@@ -468,6 +641,29 @@ class MainWindow(QMainWindow):
             self.webView.page().runJavaScript(js, after_js)
         except Exception as e:
             QMessageBox.warning(self, "Scrape", f"JS execution failed: {e}")
+
+    def _onShowPanels(self):
+        """User-requested action to show the panels grid (hides web view)."""
+        self._ensureGridVisible()
+
+    def _onShowBrowser(self):
+        """User-requested action to show the embedded browser (hides panel grid)."""
+        self._ensureWebVisible()
+
+    def _onRemovePanel(self):
+        # Remove selected panels from the PanelsView (or fallback)
+        removed: list[str] = []
+        if hasattr(self.panelGrid, 'selectedPanelIds'):
+            removed = self.panelGrid.selectedPanelIds()
+            if removed:
+                self.panelGrid.removeSelectedPanels()
+        else:
+            QMessageBox.information(self, "Remove", "Panel removal not supported for this view.")
+            return
+
+        # If the side panel was showing one of the removed panels, clear it
+        if self.sidePanel.current_panel and self.sidePanel.current_panel in removed:
+            self.sidePanel.setPanel(None)
 
     # ----------------------- Background Image Download -----------------------
     def _downloadSelectedImages(self, urls: list[str]):
