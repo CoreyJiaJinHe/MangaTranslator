@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import List, Optional
 import os
 
-from PyQt6.QtCore import Qt, pyqtSignal, QSize, QThread, QObject, QUrl, QTimer
+from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot, QSize, QThread, QObject, QUrl, QTimer
 from PyQt6.QtGui import QAction, QPixmap, QIcon
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 from PyQt6.QtWidgets import (
@@ -32,7 +32,11 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QDialog,
     QApplication,
+    QComboBox,
+    QSpinBox,
+    QCheckBox,
 )
+import json
 
 
 class PanelCard(QWidget):
@@ -106,8 +110,9 @@ class PanelsView(QWidget):
         self.listWidget.setResizeMode(QListWidget.ResizeMode.Adjust)
         self.listWidget.setViewMode(QListWidget.ViewMode.ListMode)
         self.listWidget.setMovement(QListWidget.Movement.Static)
-        # Allow multi-selection for batch operations
-        self.listWidget.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
+        # Allow multi-selection for batch operations; use ExtendedSelection so
+        # Shift+click performs a range selection (expected desktop behavior).
+        self.listWidget.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.listWidget.setMinimumWidth(180)
         # Icon-only appearance
         self.listWidget.setSpacing(6)
@@ -185,9 +190,29 @@ class PanelsView(QWidget):
             return
         from PyQt6.QtWidgets import QMenu
         menu = QMenu(self)
-        rem = menu.addAction("Remove")
+        # Offer both removing the clicked item and removing all selected items.
+        act_remove_clicked = menu.addAction("Remove This")
+        act_remove_selected = menu.addAction("Remove Selected")
         act = menu.exec(self.listWidget.mapToGlobal(pos))
-        if act is rem:
+        if act is act_remove_clicked:
+            # Remove only the item that was right-clicked
+            try:
+                pid = item.data(Qt.ItemDataRole.UserRole) or item.text()
+                # remove from internal lists if present
+                try:
+                    self._cards.remove(pid)
+                except Exception:
+                    pass
+                try:
+                    del self._pixmaps[pid]
+                except Exception:
+                    pass
+                row = self.listWidget.row(item)
+                self.listWidget.takeItem(row)
+            except Exception:
+                pass
+        elif act is act_remove_selected:
+            # Remove all currently selected items
             self.removeSelectedPanels()
 
     def _onItemClicked(self, item: QListWidgetItem):
@@ -199,11 +224,49 @@ class PanelsView(QWidget):
             self.previewLabel.setPixmap(scaled)
         self.panelSelected.emit(panel_id)
 
+    def showOcrOverlay(self, panel_id: str, blocks: list[dict]):
+        """Draw OCR bounding boxes over the panel preview.
+
+        `blocks` should be list of dicts with keys: left, top, width, height, text, conf
+        """
+        pm = self._pixmaps.get(panel_id)
+        if pm is None or pm.isNull():
+            return
+        # Draw on a copy of the original pixmap
+        try:
+            base = QPixmap(pm)
+        except Exception:
+            base = pm.copy()
+        from PyQt6.QtGui import QPainter, QPen, QColor, QBrush
+        painter = QPainter(base)
+        pen = QPen(QColor(255, 0, 0, 220))
+        pen.setWidth(2)
+        painter.setPen(pen)
+        brush = QBrush(QColor(255, 0, 0, 32))
+        painter.setBrush(brush)
+        img_w, img_h = base.width(), base.height()
+        # Draw each block rect (coordinates are in original image space)
+        for b in blocks:
+            try:
+                l = int(b.get('left', 0))
+                t = int(b.get('top', 0))
+                w = int(b.get('width', 0))
+                h = int(b.get('height', 0))
+                painter.drawRect(l, t, w, h)
+            except Exception:
+                continue
+        painter.end()
+        # Scale to preview area
+        area_w, area_h = self.previewLabel.width(), self.previewLabel.height()
+        scaled = base.scaled(area_w, area_h, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        self.previewLabel.setPixmap(scaled)
+
 
 class SidePanel(QWidget):
     """Right-side detail pane showing OCR text blocks and translations."""
     requestOcr = pyqtSignal(str)
     requestTranslate = pyqtSignal(str)
+    ocrSettingsChanged = pyqtSignal()
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -247,6 +310,39 @@ class SidePanel(QWidget):
         self.ocrBtn.clicked.connect(self._emit_ocr)
         self.txBtn.clicked.connect(self._emit_translate)
 
+        # OCR settings controls (language, confidence threshold, preprocess)
+        settingsRow = QHBoxLayout()
+        self.langCombo = QComboBox(self)
+        # Map display name -> tesseract lang code
+        self.langCombo.addItem('Japanese', 'jpn')
+        self.langCombo.addItem('Chinese (Simplified)', 'chi_sim')
+        self.langCombo.addItem('Korean', 'kor')
+        settingsRow.addWidget(QLabel("Lang:"))
+        settingsRow.addWidget(self.langCombo)
+
+        self.confSpin = QSpinBox(self)
+        self.confSpin.setRange(0, 100)
+        self.confSpin.setValue(0)
+        self.confSpin.setSuffix("%")
+        settingsRow.addWidget(QLabel("Conf:"))
+        settingsRow.addWidget(self.confSpin)
+
+        self.preprocChk = QCheckBox("Preprocess")
+        self.preprocChk.setChecked(True)
+        settingsRow.addWidget(self.preprocChk)
+
+        self.showBoxesChk = QCheckBox("Show OCR Boxes")
+        self.showBoxesChk.setChecked(False)
+        settingsRow.addWidget(self.showBoxesChk)
+
+        outer.addLayout(settingsRow)
+
+        # Wire control changes to emit the class-level signal
+        self.langCombo.currentIndexChanged.connect(lambda _: self.ocrSettingsChanged.emit())
+        self.confSpin.valueChanged.connect(lambda _: self.ocrSettingsChanged.emit())
+        self.preprocChk.stateChanged.connect(lambda _: self.ocrSettingsChanged.emit())
+        self.showBoxesChk.stateChanged.connect(lambda _: self.ocrSettingsChanged.emit())
+
     def setPanel(self, panel_id: str):
         self.current_panel = panel_id
         if panel_id:
@@ -262,8 +358,49 @@ class SidePanel(QWidget):
         if panel_id != self.current_panel:
             return
         self.blocksList.clear()
-        for b in blocks:
-            QListWidgetItem(b, self.blocksList)
+        # blocks may be list[str] or list[dict]
+        if not blocks:
+            return
+        first = blocks[0]
+        if isinstance(first, dict):
+            for b in blocks:
+                text = b.get('text', '')
+                conf = b.get('conf', None)
+                label = text if conf is None or conf < 0 else f"{text} [{conf}]"
+                QListWidgetItem(label, self.blocksList)
+        else:
+            for b in blocks:
+                QListWidgetItem(str(b), self.blocksList)
+
+    def getOcrSettings(self) -> dict:
+        """Return current OCR settings as a dict."""
+        lang = self.langCombo.currentData() or 'jpn'
+        conf = int(self.confSpin.value() or 0)
+        pre = bool(self.preprocChk.isChecked())
+        show_boxes = bool(self.showBoxesChk.isChecked())
+        return {'lang': lang, 'conf_thresh': conf, 'preprocess': pre, 'show_boxes': show_boxes}
+
+    def setOcrSettings(self, settings: dict):
+        """Apply OCR settings from a dict (best-effort)."""
+        lang = settings.get('lang', 'jpn')
+        idx = 0
+        for i in range(self.langCombo.count()):
+            if self.langCombo.itemData(i) == lang:
+                idx = i
+                break
+        self.langCombo.setCurrentIndex(idx)
+        try:
+            self.confSpin.setValue(int(settings.get('conf_thresh', 0)))
+        except Exception:
+            self.confSpin.setValue(0)
+        try:
+            self.preprocChk.setChecked(bool(settings.get('preprocess', True)))
+        except Exception:
+            self.preprocChk.setChecked(True)
+        try:
+            self.showBoxesChk.setChecked(bool(settings.get('show_boxes', False)))
+        except Exception:
+            self.showBoxesChk.setChecked(False)
 
     def setTranslation(self, panel_id: str, translated: str):
         if panel_id != self.current_panel:
@@ -283,8 +420,24 @@ class SidePanel(QWidget):
             QListWidgetItem(s, self.similarityList)
 
     def _emit_ocr(self):
-        if self.current_panel:
-            self.requestOcr.emit(self.current_panel)
+        pid = self.current_panel
+        if not pid:
+            # Try to fallback to the application's current selection if available
+            try:
+                mw = self.parent()
+                if mw and hasattr(mw, 'panelGrid'):
+                    sel = mw.panelGrid.selectedPanelIds()
+                    pid = sel[0] if sel else None
+            except Exception:
+                pid = None
+        if pid:
+            self.requestOcr.emit(pid)
+        else:
+            try:
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.information(self, "OCR", "No panel selected for OCR.")
+            except Exception:
+                pass
 
     def _emit_translate(self):
         if self.current_panel:
@@ -306,6 +459,13 @@ class MainWindow(QMainWindow):
         self._createToolbar()
         self._createLayout()
         self._connectSignals()
+        # Load persisted config and apply OCR settings (creates config file if missing)
+        try:
+            cfg = self._load_config()
+            ocr_cfg = cfg.get('ocr', {}) if isinstance(cfg, dict) else {}
+            self.sidePanel.setOcrSettings(ocr_cfg)
+        except Exception:
+            pass
 
     # ----------------------- UI Construction -----------------------
     def _createActions(self):
@@ -421,6 +581,11 @@ class MainWindow(QMainWindow):
         self.panelGrid.panelSelected.connect(self._onPanelSelected)
         self.sidePanel.requestOcr.connect(self._onRequestOcr)
         self.sidePanel.requestTranslate.connect(self._onRequestTranslate)
+        # Persist OCR settings when changed in the side panel
+        try:
+            self.sidePanel.ocrSettingsChanged.connect(self._onOcrSettingsChanged)
+        except Exception:
+            pass
         self.actLoad.triggered.connect(self._onLoadImages)
         self.actOcrAll.triggered.connect(self._onOcrAll)
         self.actTranslateSel.triggered.connect(self._onTranslateSelected)
@@ -435,6 +600,51 @@ class MainWindow(QMainWindow):
         # Forward internal signals outward for future service integration.
         self.ocrCompleted.connect(self.sidePanel.setOcrBlocks)
         self.translationCompleted.connect(self.sidePanel.setTranslation)
+        # Also show OCR overlay boxes on the preview when enabled in settings
+        try:
+            self.ocrCompleted.connect(self._onOcrOverlay)
+        except Exception:
+            pass
+
+    # ----------------------- Config helpers -----------------------
+    def _config_file_path(self) -> str:
+        # config located at ../config/config.json relative to this file
+        base = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'config'))
+        os.makedirs(base, exist_ok=True)
+        return os.path.abspath(os.path.join(base, 'config.json'))
+
+    def _load_config(self) -> dict:
+        path = self._config_file_path()
+        if not os.path.exists(path):
+            default = {'ocr': {'lang': 'jpn', 'conf_thresh': 0, 'preprocess': True}}
+            try:
+                with open(path, 'w', encoding='utf-8') as f:
+                    json.dump(default, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+            return default
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return {'ocr': {'lang': 'jpn', 'conf_thresh': 0, 'preprocess': True}}
+
+    def _save_config(self, cfg: dict) -> None:
+        path = self._config_file_path()
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            QMessageBox.warning(self, "Config", f"Failed to save config: {e}")
+
+    def _onOcrSettingsChanged(self):
+        # Persist current OCR settings to config file
+        try:
+            cfg = self._load_config() or {}
+            cfg['ocr'] = self.sidePanel.getOcrSettings()
+            self._save_config(cfg)
+        except Exception:
+            pass
 
     # ----------------------- Actions -----------------------
     def _onLoadImages(self):
@@ -454,14 +664,83 @@ class MainWindow(QMainWindow):
         self.panelSelected.emit(panel_id)
 
     def _onRequestOcr(self, panel_id: str):
-        # Placeholder: simulate OCR result.
-        dummy_blocks = ["示例テキスト", "サンプル", "テスト"]  # Example Japanese strings
-        self.ocrCompleted.emit(panel_id, dummy_blocks)
+        # Perform OCR on a single panel in a background thread to keep UI responsive.
+        pm = getattr(self.panelGrid, '_pixmaps', {}).get(panel_id)
+        if not pm:
+            QMessageBox.information(self, "OCR", f"Panel not found: {panel_id}")
+            return
+
+        # Brief user feedback that OCR is starting
+        try:
+            self.statusBar().showMessage(f"Starting OCR for {panel_id}...", 4000)
+        except Exception:
+            pass
+
+        qimg = pm.toImage()
+
+        # Get OCR settings from side panel
+        try:
+            st = self.sidePanel.getOcrSettings()
+            lang = st.get('lang', 'jpn')
+            conf = int(st.get('conf_thresh', 0) or 0)
+            pre = bool(st.get('preprocess', True))
+        except Exception:
+            lang, conf, pre = 'jpn', 0, True
+
+        # Create worker + thread
+        worker = OcrWorker(panel_id, qimg, lang=lang, conf_thresh=conf, preprocess=pre)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+
+        # Keep references so they are not GC'd while running
+        if not hasattr(self, '_activeOcrThreads'):
+            self._activeOcrThreads = []
+        self._activeOcrThreads.append((thread, worker))
+
+        # Wire signals
+        worker.finished.connect(lambda pid, blocks: self._onOcrWorkerFinished(pid, blocks))
+        worker.error.connect(lambda pid, err: self._onOcrWorkerError(pid, err))
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        thread.started.connect(worker.run)
+        thread.start()
 
     def _onRequestTranslate(self, panel_id: str):
         # Placeholder translation echo.
         translated = "(EN) " + "; ".join(["example", "sample", "test"])
         self.translationCompleted.emit(panel_id, translated)
+
+    def _onOcrWorkerFinished(self, panel_id: str, blocks: list):
+        try:
+            self.ocrCompleted.emit(panel_id, blocks)
+        finally:
+            # cleanup any finished threads from the active list
+            if hasattr(self, '_activeOcrThreads'):
+                self._activeOcrThreads = [(t, w) for (t, w) in self._activeOcrThreads if w is not None and w.panel_id != panel_id]
+
+    def _onOcrWorkerError(self, panel_id: str, errmsg: str):
+        QMessageBox.warning(self, "OCR Error", f"OCR failed for {panel_id}: {errmsg}")
+        # ensure removal from active list
+        if hasattr(self, '_activeOcrThreads'):
+            self._activeOcrThreads = [(t, w) for (t, w) in self._activeOcrThreads if w is not None and w.panel_id != panel_id]
+
+    def _onOcrOverlay(self, panel_id: str, blocks: list):
+        """If the user has enabled overlay boxes, render them on the preview for the panel."""
+        try:
+            settings = self.sidePanel.getOcrSettings()
+            if not settings.get('show_boxes', False):
+                return
+        except Exception:
+            return
+        # blocks expected as list[dict] with left,top,width,height
+        if not blocks or not isinstance(blocks, list) or not isinstance(blocks[0], dict):
+            return
+        try:
+            self.panelGrid.showOcrOverlay(panel_id, blocks)
+        except Exception:
+            pass
 
     def _onOcrAll(self):
         # Run OCR on selected panels if any, otherwise on all visible panels.
@@ -477,22 +756,91 @@ class MainWindow(QMainWindow):
         if total == 0:
             QMessageBox.information(self, "OCR", "No panels to OCR.")
             return
+        # Prepare (panel_id, QImage) items for batch processing
+        items: list[tuple[str, object]] = []
+        for pid in ids:
+            pm = getattr(self.panelGrid, '_pixmaps', {}).get(pid)
+            if pm:
+                items.append((pid, pm.toImage()))
+
+        if not items:
+            QMessageBox.information(self, "OCR", "No panel images available for OCR.")
+            return
+
         from PyQt6.QtWidgets import QProgressDialog
-        progress = QProgressDialog("Running OCR...", "Cancel", 0, total, self)
+        progress = QProgressDialog("Running OCR...", "Cancel", 0, len(items), self)
         progress.setWindowTitle("OCR Panels")
         progress.setWindowModality(Qt.WindowModality.ApplicationModal)
         progress.show()
-        done = 0
-        for i, pid in enumerate(ids):
-            if progress.wasCanceled():
-                break
-            # Placeholder OCR result
-            self.ocrCompleted.emit(pid, ["全体OCR", "ダミー"])
-            done += 1
-            progress.setValue(done)
-            QApplication.processEvents()
-        progress.close()
-        QMessageBox.information(self, "OCR", f"Processed {done} / {total} panels.")
+
+        # Get OCR settings from side panel
+        try:
+            st = self.sidePanel.getOcrSettings()
+            lang = st.get('lang', 'jpn')
+            conf = int(st.get('conf_thresh', 0) or 0)
+            pre = bool(st.get('preprocess', True))
+        except Exception:
+            lang, conf, pre = 'jpn', 0, True
+
+        # Batch worker + thread
+        worker = OcrBatchWorker(items, lang=lang, conf_thresh=conf, preprocess=pre)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+
+        # Keep reference to allow cancel and avoid GC
+        self._activeOcrBatch = (thread, worker)
+
+        worker.itemFinished.connect(lambda pid, blocks: self.ocrCompleted.emit(pid, blocks))
+        # Collect per-item batch errors and show a single aggregated dialog after completion
+        batch_errors: list[tuple[str, str]] = []
+        def _collect_item_error(pid: str, err: str):
+            try:
+                batch_errors.append((pid, err))
+            except Exception:
+                pass
+        try:
+            worker.itemError.connect(_collect_item_error)
+        except Exception:
+            pass
+        worker.progress.connect(lambda done, total: progress.setValue(done))
+
+        def on_finished(done_count: int):
+            progress.close()
+            QMessageBox.information(self, "OCR", f"Processed {done_count} / {len(items)} panels.")
+            # If any per-item errors were collected, present a single aggregated warning.
+            try:
+                if batch_errors:
+                    # Show up to a handful of errors to avoid overwhelming the user
+                    max_show = 8
+                    lines = [f"{pid}: {err}" for pid, err in batch_errors[:max_show]]
+                    more = len(batch_errors) - len(lines)
+                    if more > 0:
+                        lines.append(f"... and {more} more errors")
+                    QMessageBox.warning(self, "OCR Errors", "Errors occurred during OCR:\n" + "\n".join(lines))
+            except Exception:
+                pass
+            try:
+                worker.deleteLater()
+            except Exception:
+                pass
+            try:
+                thread.deleteLater()
+            except Exception:
+                pass
+            self._activeOcrBatch = None
+
+        worker.finished.connect(on_finished)
+        worker.finished.connect(thread.quit)
+        thread.started.connect(worker.run)
+        thread.start()
+
+        # Wire cancel
+        def on_cancel():
+            try:
+                worker.cancel()
+            except Exception:
+                pass
+        progress.canceled.connect(on_cancel)
 
     def _onTranslateSelected(self):
         # If panels are selected in the panels view, translate those; otherwise translate the current panel.
@@ -670,6 +1018,24 @@ class MainWindow(QMainWindow):
         """Download chosen image URLs using a QThread worker with signals for progress/cancel."""
         if not urls:
             return
+        # Deduplicate exact URL matches (preserve first occurrence order).
+        # This avoids adding the same scraped image multiple times when the
+        # page contains duplicate <img> tags or identical sources.
+        seen_urls = set()
+        unique_urls: list[str] = []
+        dup_count = 0
+        for u in urls:
+            if u in seen_urls:
+                dup_count += 1
+                continue
+            seen_urls.add(u)
+            unique_urls.append(u)
+        if dup_count:
+            try:
+                QMessageBox.information(self, "Scrape", f"Skipped {dup_count} duplicate image(s).")
+            except Exception:
+                pass
+        urls = unique_urls
         out_dir = os.path.abspath("_scraped_images")
         os.makedirs(out_dir, exist_ok=True)
 
@@ -685,17 +1051,125 @@ class MainWindow(QMainWindow):
         # keep a reference on self so it isn't GC'd while running
         self._activeDownloadWorker = worker
 
+        # Collect per-item errors to present a single aggregated dialog at the end
+        batch_errors: list[tuple[str, str]] = []
+        def _collect_download_error(url_or_id: str, errmsg: str):
+            try:
+                batch_errors.append((url_or_id, errmsg))
+            except Exception:
+                pass
+
         # Wiring
         worker.progress.connect(lambda idx: progressDlg.setValue(idx))
         worker.itemReady.connect(lambda panel_id, pm: self.panelGrid.addPanel(panel_id, pm))
+        try:
+            worker.itemError.connect(_collect_download_error)
+        except Exception:
+            pass
+
+        # Temporarily suppress modal messageboxes while downloads are in-flight.
+        # Some network errors or other signal handlers may show per-item dialogs; capture them
+        # and present a single aggregated dialog after the batch completes.
+        suppressed_msgs: list[tuple[str, str]] = []
+        from PyQt6.QtWidgets import QMessageBox as _QMB
+        _orig_warning = _QMB.warning
+        _orig_info = _QMB.information
+
+        def _capture_warning(parent, title, text, *args, **kwargs):
+            try:
+                suppressed_msgs.append((title or 'Warning', text or ''))
+            except Exception:
+                pass
+            # emulate standard return value (button role) as None
+            return None
+
+        def _capture_info(parent, title, text, *args, **kwargs):
+            try:
+                suppressed_msgs.append((title or 'Info', text or ''))
+            except Exception:
+                pass
+            return None
+
+        # Patch QMessageBox functions
+        try:
+            _QMB.warning = staticmethod(_capture_warning)  # type: ignore[attr-defined]
+            _QMB.information = staticmethod(_capture_info)  # type: ignore[attr-defined]
+        except Exception:
+            # If patching fails, continue without suppression
+            pass
+
+        def _restore_messageboxes():
+            try:
+                _QMB.warning = _orig_warning
+                _QMB.information = _orig_info
+            except Exception:
+                pass
+
+        # Guard to ensure we only present the summary once even if `finished` fires
+        # multiple times due to races with dialog close / cancel handlers.
+        _done_called = {'v': False}
         def done(status: str, added: int, errors: int, cancelled: bool):
-            progressDlg.close()
-            QMessageBox.information(self, "Download", f"{status}. Added {added} image(s). Errors: {errors}")
+            if _done_called['v']:
+                return
+            _done_called['v'] = True
+            # restore message boxes first so subsequent dialogs (summary) show normally
+            _restore_messageboxes()
+            # Prevent on_close from racing in while we close the dialog: clear active worker
+            try:
+                self._activeDownloadWorker = None
+            except Exception:
+                pass
+            # Disconnect the on_close handler so calling close() does not trigger a cancel
+            try:
+                progressDlg.finished.disconnect(on_close)
+            except Exception:
+                pass
+            try:
+                progressDlg.close()
+            except Exception:
+                pass
+            # Show the regular end-of-download info
+            try:
+                _orig_info(self, "Download", f"{status}. Added {added} image(s). Errors: {errors}")
+            except Exception:
+                pass
+            # If any per-item errors were collected via signals, show aggregated warning
+            try:
+                if batch_errors:
+                    max_show = 8
+                    lines = [f"{u}: {e}" for u, e in batch_errors[:max_show]]
+                    more = len(batch_errors) - len(lines)
+                    if more > 0:
+                        lines.append(f"... and {more} more errors")
+                    _orig_warning(self, "Download Errors", "Errors occurred during download:\n" + "\n".join(lines))
+            except Exception:
+                pass
+            # Also show any suppressed modal messages that were captured during the run (limit output)
+            try:
+                if suppressed_msgs:
+                    # Deduplicate suppressed messages that mirror per-item errors (avoid double-reporting)
+                    seen_texts = set(u for u, _ in batch_errors)
+                    filtered = []
+                    for title, msg in suppressed_msgs:
+                        # skip if message contains a URL or id we've already reported
+                        if any(key in msg for key in seen_texts):
+                            continue
+                        filtered.append((title, msg))
+                    if filtered:
+                        max_show = 6
+                        lines = [f"{t}: {m}" for t, m in filtered[:max_show]]
+                        more = len(filtered) - len(lines)
+                        if more > 0:
+                            lines.append(f"... and {more} more messages")
+                        _orig_warning(self, "Additional Messages During Download", "Some dialogs were suppressed during batch download:\n" + "\n".join(lines))
+            except Exception:
+                pass
             try:
                 worker.deleteLater()
             except Exception:
                 pass
             self._activeDownloadWorker = None
+
         worker.finished.connect(done)
 
         def request_cancel():
@@ -917,6 +1391,7 @@ class AsyncImageDownloadWorker(QObject):
     """
     progress = pyqtSignal(int)            # current index
     itemReady = pyqtSignal(str, QPixmap)  # panel_id, pixmap
+    itemError = pyqtSignal(str, str)      # url_or_panel_id, error message
     finished = pyqtSignal(str, int, int, bool)  # status, added, errors, cancelled
 
     def __init__(self, urls: list[str], out_dir: str, existing_count):
@@ -980,12 +1455,25 @@ class AsyncImageDownloadWorker(QObject):
                 pm = QPixmap(path)
                 if pm.isNull():
                     self._errors += 1
+                    try:
+                        self.itemError.emit(u, 'Decoded image is invalid')
+                    except Exception:
+                        pass
                 else:
                     panel_id = f"scrape_{self._existing_count_cb()+1}"
                     self.itemReady.emit(panel_id, pm)
                     self._added += 1
             except Exception:
                 self._errors += 1
+                try:
+                    import traceback
+                    traceback.print_exc()
+                except Exception:
+                    pass
+                try:
+                    self.itemError.emit(u, 'Data URI decode or save failed')
+                except Exception:
+                    pass
             self.progress.emit(idx)
             self._index += 1
             QTimer.singleShot(0, self._start_next)
@@ -999,7 +1487,40 @@ class AsyncImageDownloadWorker(QObject):
         reply.errorOccurred.connect(lambda err: self._on_reply_error(reply, err))
 
     def _on_reply_error(self, reply: QNetworkReply, err):
+        # On certain SSL/handshake-related failures Qt's network stack can fail
+        # while a Python-based fetch (requests/urllib) would succeed. Try a
+        # threaded fallback before declaring the item failed.
+        try:
+            url = reply.url().toString() if hasattr(reply, 'url') else ''
+        except Exception:
+            url = ''
+        try:
+            errstr = reply.errorString() if hasattr(reply, 'errorString') else str(err)
+        except Exception:
+            errstr = str(err)
+
+        ssl_indicators = ['ssl', 'handshake', 'unsupported function', 'certificate', 'secure']
+        if url and any(k in errstr.lower() for k in ssl_indicators):
+            # attempt fallback download using Python libraries in a QThread
+            try:
+                # delete the Qt reply early; we'll continue via fallback
+                try:
+                    reply.deleteLater()
+                except Exception:
+                    pass
+                self._currentReply = None
+                self._start_fallback_download(url)
+                return
+            except Exception:
+                # if fallback setup fails, fall through to emit error below
+                pass
+
+        # Non-SSL or fallback not attempted/failed — emit per-item error and continue
         self._errors += 1
+        try:
+            self.itemError.emit(url or str(self._index), errstr)
+        except Exception:
+            pass
         idx = self._index + 1
         self.progress.emit(idx)
         try:
@@ -1007,6 +1528,127 @@ class AsyncImageDownloadWorker(QObject):
         except Exception:
             pass
         self._currentReply = None
+        self._index += 1
+        QTimer.singleShot(0, self._start_next)
+
+    def _start_fallback_download(self, url: str):
+        """Start a fallback downloader in a QThread that tries requests then urllib."""
+        class _FallbackWorker(QObject):
+            ready = pyqtSignal(bytes)
+            failed = pyqtSignal(str)
+            finished = pyqtSignal()
+
+            def __init__(self, url: str):
+                super().__init__()
+                self.url = url
+
+            @pyqtSlot()
+            def run(self):
+                try:
+                    try:
+                        import requests
+                        hdrs = {'User-Agent': 'Mozilla/5.0'}
+                        r = requests.get(self.url, headers=hdrs, timeout=16, verify=False)
+                        data = r.content
+                    except Exception:
+                        try:
+                            import urllib.request, ssl
+                            ctx = ssl.create_default_context()
+                            ctx.check_hostname = False
+                            ctx.verify_mode = ssl.CERT_NONE
+                            with urllib.request.urlopen(self.url, context=ctx, timeout=16) as resp:
+                                data = resp.read()
+                        except Exception:
+                            data = b''
+                    if not data:
+                        self.failed.emit('Fallback: empty response')
+                    else:
+                        self.ready.emit(data)
+                except Exception as e:
+                    try:
+                        import traceback
+                        traceback.print_exc()
+                    except Exception:
+                        pass
+                    self.failed.emit(str(e))
+                finally:
+                    self.finished.emit()
+
+        # Create worker/thread
+        try:
+            worker = _FallbackWorker(url)
+            thread = QThread(self)
+            worker.moveToThread(thread)
+            # When data ready, handle it and continue to next item
+            worker.ready.connect(lambda data: self._on_fallback_ready(url, data))
+            worker.failed.connect(lambda err: self._on_fallback_failed(url, err))
+            worker.finished.connect(thread.quit)
+            thread.started.connect(worker.run)
+            thread.finished.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            # keep temporary references to avoid GC until finished
+            if not hasattr(self, '_fallback_threads'):
+                self._fallback_threads = []
+            self._fallback_threads.append((thread, worker))
+            thread.start()
+        except Exception:
+            # if fallback couldn't be started, mark as failed immediately
+            self._errors += 1
+            try:
+                self.itemError.emit(url or str(self._index), 'Fallback start failed')
+            except Exception:
+                pass
+            idx = self._index + 1
+            self.progress.emit(idx)
+            self._index += 1
+            QTimer.singleShot(0, self._start_next)
+
+    def _on_fallback_ready(self, url: str, data: bytes):
+        # Write file and emit itemReady if valid image
+        try:
+            import os
+            url_path = url.split('?')[0]
+            tail = url_path.split('/')[-1] or f"img_{self._existing_count_cb()+1}.bin"
+            if '.' not in tail:
+                tail += '.png'
+            path = os.path.join(self._out_dir, tail)
+            with open(path, 'wb') as f:
+                f.write(data)
+            pm = QPixmap()
+            ok = pm.loadFromData(data)
+            if not ok or pm.isNull():
+                # try loading from saved file as fallback
+                pm = QPixmap(path)
+            if pm.isNull():
+                self._errors += 1
+                try:
+                    self.itemError.emit(url, 'Fallback download produced invalid image')
+                except Exception:
+                    pass
+            else:
+                panel_id = f"scrape_{self._existing_count_cb()+1}"
+                self.itemReady.emit(panel_id, pm)
+                self._added += 1
+        except Exception:
+            self._errors += 1
+            try:
+                self.itemError.emit(url, 'Fallback save or decode failed')
+            except Exception:
+                pass
+        # finalize this item and move to next
+        idx = self._index + 1
+        self.progress.emit(idx)
+        self._index += 1
+        QTimer.singleShot(0, self._start_next)
+
+    def _on_fallback_failed(self, url: str, errmsg: str):
+        try:
+            self._errors += 1
+            self.itemError.emit(url, f'Fallback failed: {errmsg}')
+        except Exception:
+            pass
+        idx = self._index + 1
+        self.progress.emit(idx)
         self._index += 1
         QTimer.singleShot(0, self._start_next)
 
@@ -1026,12 +1668,25 @@ class AsyncImageDownloadWorker(QObject):
             pm = QPixmap(path)
             if pm.isNull():
                 self._errors += 1
+                try:
+                    self.itemError.emit(reply.url().toString(), 'Downloaded data is not a valid image')
+                except Exception:
+                    pass
             else:
                 panel_id = f"scrape_{self._existing_count_cb()+1}"
                 self.itemReady.emit(panel_id, pm)
                 self._added += 1
         except Exception:
             self._errors += 1
+            try:
+                import traceback
+                traceback.print_exc()
+            except Exception:
+                pass
+            try:
+                self.itemError.emit(reply.url().toString() if hasattr(reply, 'url') else str(self._index), 'Download or save failed')
+            except Exception:
+                pass
         idx = self._index + 1
         self.progress.emit(idx)
         try:
@@ -1061,6 +1716,9 @@ class AsyncImagePreviewer(QObject):
         super().__init__(parent)
         self._manager = QNetworkAccessManager(self)
         self._currentReply: QNetworkReply | None = None
+        self._currentUrl: str | None = None
+        self._fallbackThread: QThread | None = None
+        self._fallbackWorker: QObject | None = None
 
     def fetch(self, url: str):
         # Abort any in-flight request
@@ -1071,7 +1729,7 @@ class AsyncImagePreviewer(QObject):
                 pass
             self._currentReply.deleteLater()
             self._currentReply = None
-
+        self._currentUrl = url
         req = QNetworkRequest(QUrl(url))
         reply = self._manager.get(req)
         self._currentReply = reply
@@ -1094,6 +1752,93 @@ class AsyncImagePreviewer(QObject):
             errstr = reply.errorString() if hasattr(reply, 'errorString') else str(err)
         except Exception:
             errstr = str(err)
+        # If SSL handshake related, attempt a Python-based fallback download in a thread
+        url_str = ''
+        try:
+            url_str = reply.url().toString()
+        except Exception:
+            url_str = self._currentUrl or ''
+
+        # common indicator text for SSL handshake issues
+        ssl_indicators = ['ssl', 'handshake', 'unsupported function', 'certificate', 'secure']
+        if any(k in errstr.lower() for k in ssl_indicators) and url_str:
+            try:
+                # Start fallback downloader in a QThread to avoid blocking UI
+                class _FallbackWorker(QObject):
+                    finished = pyqtSignal()
+                    ready = pyqtSignal(QPixmap)
+                    failed = pyqtSignal(str)
+
+                    def __init__(self, url: str):
+                        super().__init__()
+                        self.url = url
+
+                    @pyqtSlot()
+                    def run(self):
+                        try:
+                            # Prefer requests if available (disable verify to bypass cert issues)
+                            try:
+                                import requests
+                                hdrs = {'User-Agent': 'Mozilla/5.0'}
+                                r = requests.get(self.url, headers=hdrs, timeout=12, verify=False)
+                                data = r.content
+                            except Exception:
+                                # Fallback to urllib with unverified SSL context
+                                try:
+                                    import urllib.request, ssl
+                                    ctx = ssl.create_default_context()
+                                    ctx.check_hostname = False
+                                    ctx.verify_mode = ssl.CERT_NONE
+                                    with urllib.request.urlopen(self.url, context=ctx, timeout=12) as resp:
+                                        data = resp.read()
+                                except Exception as e:
+                                    raise
+                            pm = QPixmap()
+                            ok = pm.loadFromData(data)
+                            if not ok or pm.isNull():
+                                self.failed.emit('Fallback decode failed')
+                            else:
+                                self.ready.emit(pm)
+                        except Exception as e:
+                            try:
+                                import traceback
+                                traceback.print_exc()
+                            except Exception:
+                                pass
+                            self.failed.emit(str(e))
+                        finally:
+                            self.finished.emit()
+
+                # Clean up any existing fallback
+                try:
+                    if self._fallbackThread is not None:
+                        self._fallbackThread.quit()
+                        self._fallbackThread.wait(100)
+                except Exception:
+                    pass
+
+                worker = _FallbackWorker(url_str)
+                thread = QThread(self)
+                worker.moveToThread(thread)
+                worker.ready.connect(lambda pm: (self.ready.emit(pm)))
+                worker.failed.connect(lambda e: self.failed.emit(f"Fallback failed: {e}"))
+                worker.finished.connect(thread.quit)
+                thread.started.connect(worker.run)
+                thread.finished.connect(worker.deleteLater)
+                thread.finished.connect(thread.deleteLater)
+                self._fallbackThread = thread
+                self._fallbackWorker = worker
+                thread.start()
+                # return early; don't emit original failure yet
+                try:
+                    reply.deleteLater()
+                except Exception:
+                    pass
+                self._currentReply = None
+                return
+            except Exception:
+                pass
+
         self.failed.emit(errstr)
         try:
             reply.deleteLater()
@@ -1126,6 +1871,98 @@ class AsyncImagePreviewer(QObject):
             self._currentReply = None
         self.finished.emit()
 
+
+class OcrWorker(QObject):
+    """Worker that performs OCR on a single panel image in a background QThread.
+
+    Emits `finished(panel_id, blocks_list)` or `error(panel_id, errmsg)`.
+    """
+    finished = pyqtSignal(str, list)
+    error = pyqtSignal(str, str)
+
+    def __init__(self, panel_id: str, qimage, lang: str = 'jpn', conf_thresh: int = 0, preprocess: bool = True):
+        super().__init__()
+        self.panel_id = panel_id
+        self.qimage = qimage
+        self.lang = lang
+        self.conf_thresh = conf_thresh
+        self.preprocess = preprocess
+        self._cancel = False
+
+    @pyqtSlot()
+    def run(self):
+        # Add verbose debugging to help diagnose silent failures (conversion, pytesseract errors)
+        try:
+            import traceback
+            print(f"[OCR] Starting OCR for {self.panel_id} (lang={self.lang} preprocess={self.preprocess} conf={self.conf_thresh})")
+            from services.ocr.pytesseract_service import PyTesseractOCR
+            ocr = PyTesseractOCR()
+            blocks = ocr.extract_blocks(self.qimage, lang=self.lang, preprocess=self.preprocess, conf_thresh=self.conf_thresh)
+            print(f"[OCR] Completed for {self.panel_id}: found {len(blocks)} blocks")
+            # Emit structured blocks (list[dict]) so UI can show boxes + text
+            self.finished.emit(self.panel_id, blocks)
+        except Exception as e:
+            try:
+                import traceback
+                traceback.print_exc()
+            except Exception:
+                pass
+            self.error.emit(self.panel_id, str(e))
+
+
+class OcrBatchWorker(QObject):
+    """Sequential OCR worker for a list of (panel_id, QImage).
+
+    Emits `itemFinished(panel_id, blocks)`, `progress(done, total)`, and `finished(done)`.
+    """
+    itemFinished = pyqtSignal(str, list)
+    itemError = pyqtSignal(str, str)
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(int)
+
+    def __init__(self, items: list, lang: str = 'jpn', conf_thresh: int = 0, preprocess: bool = True):
+        super().__init__()
+        self._items = items
+        self.lang = lang
+        self.conf_thresh = conf_thresh
+        self.preprocess = preprocess
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    @pyqtSlot()
+    def run(self):
+        done = 0
+        total = len(self._items)
+        try:
+            import traceback
+            from services.ocr.pytesseract_service import PyTesseractOCR
+            ocr = PyTesseractOCR()
+            for panel_id, qimage in self._items:
+                if self._cancel:
+                    break
+                try:
+                    print(f"[OCR-Batch] OCRing {panel_id} (lang={self.lang} preprocess={self.preprocess} conf={self.conf_thresh})")
+                    blocks = ocr.extract_blocks(qimage, lang=self.lang, preprocess=self.preprocess, conf_thresh=self.conf_thresh)
+                    print(f"[OCR-Batch] {panel_id}: found {len(blocks)} blocks")
+                except Exception as e:
+                    try:
+                        traceback.print_exc()
+                    except Exception:
+                        pass
+                    blocks = []
+                    # notify caller of per-item error
+                    try:
+                        self.itemError.emit(panel_id, str(e))
+                    except Exception:
+                        pass
+                done += 1
+                # Emit the structured blocks (or empty list on error) so UI can show boxes + text
+                self.itemFinished.emit(panel_id, blocks)
+                self.progress.emit(done, total)
+        finally:
+            self.finished.emit(done)
 
 def create_app_window() -> MainWindow:
     """Factory to create the fully constructed MainWindow."""

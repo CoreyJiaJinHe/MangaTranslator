@@ -1,5 +1,5 @@
 BallonsTranslator/
 .venv
 __pycache__/
-
+/_scraped_images/
 .env

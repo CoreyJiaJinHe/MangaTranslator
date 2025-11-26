@@ -1,0 +1,8 @@
+{
+  "ocr": {
+    "lang": "jpn",
+    "conf_thresh": 0,
+    "preprocess": true,
+    "show_boxes": true
+  }
+}
