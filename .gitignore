@@ -3,3 +3,5 @@ BallonsTranslator/
 __pycache__/
 /_scraped_images/
 .env
+MangaWebTranslator/services/ocr/debug/
+MangaWebTranslator/data/
