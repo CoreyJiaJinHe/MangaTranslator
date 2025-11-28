@@ -1895,8 +1895,8 @@ class OcrWorker(QObject):
         try:
             import traceback
             print(f"[OCR] Starting OCR for {self.panel_id} (lang={self.lang} preprocess={self.preprocess} conf={self.conf_thresh})")
-            from services.ocr.pytesseract_service import PyTesseractOCR
-            ocr = PyTesseractOCR()
+            from services.ocr.ocr_adapter import create_ocr
+            ocr = create_ocr()
             blocks = ocr.extract_blocks(self.qimage, lang=self.lang, preprocess=self.preprocess, conf_thresh=self.conf_thresh)
             print(f"[OCR] Completed for {self.panel_id}: found {len(blocks)} blocks")
             # Emit structured blocks (list[dict]) so UI can show boxes + text
@@ -1937,8 +1937,8 @@ class OcrBatchWorker(QObject):
         total = len(self._items)
         try:
             import traceback
-            from services.ocr.pytesseract_service import PyTesseractOCR
-            ocr = PyTesseractOCR()
+            from services.ocr.ocr_adapter import create_ocr
+            ocr = create_ocr()
             for panel_id, qimage in self._items:
                 if self._cancel:
                     break

@@ -5,3 +5,4 @@ __pycache__/
 .env
 MangaWebTranslator/services/ocr/debug/
 MangaWebTranslator/data/
+junk do not use/

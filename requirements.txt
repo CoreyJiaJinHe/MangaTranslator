@@ -1,4 +1,3 @@
-pytesseract
 selenium
 Pillow
 opencv-python
@@ -10,3 +9,6 @@ lxml
 svgpathtools
 webdriver-manager
 PyQt6-WebEngine
+# Optional modern manga OCR backend (requires torch & model download):
+# Install only if you want the new `manga_ocr` backend
+manga-ocr
