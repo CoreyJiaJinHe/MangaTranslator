@@ -6,3 +6,5 @@ __pycache__/
 MangaWebTranslator/services/ocr/debug/
 MangaWebTranslator/data/
 junk do not use/
+/_ocr_debug/
+manga-image-translator-beta-0.2.1/
