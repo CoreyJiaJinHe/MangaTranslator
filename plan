@@ -1,0 +1,43 @@
+Plan is:
+
+We use mangaocr.
+
+We use cv2 find contours. 
+
+We look for contours that cover less than 50% of the page.
+We filter out overlapping contours.
+We display the remaining contours. Remaining contours should be between 0-10. User gets to choose which ones to keep and send to manga-ocr.
+User also gets to draw his own rectangle selection.
+Whenever a user draws his own selection, once it is done, it gets sent to manga-ocr to ocr.
+
+
+
+
+To improve contour detection and reduce false positives (wrong contours), consider these strategies:
+
+1. **Tune Threshold Values**:  #Already tried.
+    - Adjust the fixed and Otsu threshold values. Too low/high thresholds can merge or split text regions incorrectly.
+    - Try adaptive thresholding with different block sizes and constants.
+
+2. **Morphological Operations**:   #Try this.
+    - Experiment with kernel size and shape in `cv2.dilate` and also try `cv2.erode` or `cv2.morphologyEx` (e.g., `cv2.MORPH_OPEN` to remove noise).
+    - Use smaller kernels or fewer iterations to avoid merging separate text lines/boxes.
+
+3. **Contour Filtering**: #More filtering is fine. Aspect ratio checks is ideal.
+    - Increase the minimum width/height or area for accepted contours.
+    - Add aspect ratio checks (e.g., ignore extremely wide or tall boxes unlikely to be text).
+    - Filter by contour area, perimeter, or solidity (contour area / bounding rect area).
+
+4. **Subsumed Rectangles**:
+    - Enable and tune the "subsumed by larger rect" logic to remove nested or overlapping boxes.
+
+5. **Preprocessing**:  
+    - Apply Gaussian blur to reduce noise before thresholding.
+    - Use contrast enhancement (e.g., `cv2.equalizeHist` or `ImageOps.autocontrast`).
+
+6. **Postprocessing**:  
+    - Merge overlapping or nearby rectangles if they likely belong to the same text block.
+    - Remove rectangles near the image border if your images have noisy edges.
+
+7. **Debugging**:  
+    - Visualize each step and compare overlays to see which parameters best isolate text.

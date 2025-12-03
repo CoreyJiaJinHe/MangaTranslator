@@ -7,8 +7,11 @@
 #   - Graceful shutdown / resource cleanup
 # """
 from __future__ import annotations
-
-from ui.main_window import create_app_window
+try:
+    import torch
+except ImportError:
+    raise RuntimeError("PyTorch is required to run the application. Please install it before proceeding.")
+from MangaWebTranslator.ui.main_window import create_app_window
 import sys
 
 try:

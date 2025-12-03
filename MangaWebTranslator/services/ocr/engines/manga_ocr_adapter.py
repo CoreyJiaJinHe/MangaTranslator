@@ -29,26 +29,31 @@ class MangaOcrAdapter:
             return True
         try:
             # Import only when queried; may raise ImportError if not installed.
+            # Note: Top-level import of torch has been removed; use lazy import inside methods only.
             from manga_ocr import MangaOcr  # type: ignore
             self._MangaOcr = MangaOcr
             return True
-        except Exception:
+        except ImportError as exc:
+            logger.debug("manga_ocr import failed: %s", exc, exc_info=True)
+            return False
+        except Exception as exc:
+            # Be conservative: some environments may raise non-ImportError issues on import
+            logger.warning("manga_ocr import raised unexpected error: %s", exc)
             return False
 
-    def _ensure_impl(self, device: str = 'cpu'):
+    def _ensure_impl(self):
         if self._impl is None:
             try:
                 MangaOcr = getattr(self, '_MangaOcr', None)
                 if MangaOcr is None:
                     from manga_ocr import MangaOcr  # type: ignore
                     MangaOcr = MangaOcr
-                # Construct with default options; let library manage model download
-                self._impl = MangaOcr(device=device)
+                self._impl = MangaOcr()
             except Exception as e:
                 logger.exception('Failed initializing MangaOcr: %s', e)
                 raise
 
-    def recognize(self, pil_image, lang: str = 'jpn', device: str = 'cpu') -> Dict:
+    def recognize(self, pil_image, lang: str = 'jpn') -> Dict:
         """Recognize text from a PIL `Image`.
 
         Returns a dict: { 'text': str, 'blocks': [ {text,left,top,width,height,conf}, ... ] }
@@ -57,7 +62,7 @@ class MangaOcrAdapter:
         """
         if not self.available():
             raise RuntimeError('manga-ocr not available')
-        self._ensure_impl(device=device)
+        self._ensure_impl()
         try:
             # Typical usage: `mocr = MangaOcr(); res = mocr(pil_image)`
             res = self._impl(pil_image)

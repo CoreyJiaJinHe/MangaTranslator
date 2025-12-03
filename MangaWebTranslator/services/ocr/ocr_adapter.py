@@ -11,7 +11,7 @@ import os
 import logging
 from typing import Any, Dict
 
-from . import preprocess
+from . import ocr_preprocess
 from .ocr_stub import StubOCR
 
 logger = logging.getLogger(__name__)
@@ -42,36 +42,66 @@ def create_ocr(cfg: Dict | None = None):
     backend = _select_backend_name(cfg)
     device = os.getenv('MANGA_OCR_DEVICE', 'cpu')
 
-    # Try manga-ocr if requested or by default
-    target_names = []
+    # Behavior when backend explicitly requested
     if backend:
-        target_names.append(backend)
-    else:
-        target_names.append('manga-ocr')
-
-    for name in target_names:
+        name = backend
         if name in ('manga-ocr', 'mangaocr', 'manga'):
             try:
                 from .engines.manga_ocr_adapter import MangaOcrAdapter
                 adapter = MangaOcrAdapter()
-                if adapter.available():
-                    logger.info('Using manga-ocr backend (device=%s)', device)
+                if not adapter.available():
+                    msg = (
+                        "Requested OCR backend 'manga-ocr' is not available. "
+                        )
+                    logger.error(msg)
+                    raise RuntimeError(msg)
 
-                    class _Wrapper:
-                        def extract_text(self, image, **kwargs) -> str:
-                            pil = preprocess.qimage_to_pil(image) if not hasattr(image, 'size') else image
-                            out = adapter.recognize(pil, lang=kwargs.get('lang', 'jpn'), device=device)
-                            return out.get('text', '')
+                logger.info('Using manga-ocr backend (device=%s)', device)
 
-                        def extract_blocks(self, image, **kwargs) -> list:
-                            pil = preprocess.qimage_to_pil(image) if not hasattr(image, 'size') else image
-                            out = adapter.recognize(pil, lang=kwargs.get('lang', 'jpn'), device=device)
-                            return out.get('blocks', [])
+                class _Wrapper:
+                    def extract_text(self, image, **kwargs) -> str:
+                        pil = ocr_preprocess.qimage_to_pil(image) if not hasattr(image, 'size') else image
+                        out = adapter.recognize(pil, lang=kwargs.get('lang', 'jpn'))
+                        return out.get('text', '')
 
-                    return _Wrapper()
+                    def extract_blocks(self, image, **kwargs) -> list:
+                        pil = ocr_preprocess.qimage_to_pil(image) if not hasattr(image, 'size') else image
+                        out = adapter.recognize(pil, lang=kwargs.get('lang', 'jpn'))
+                        return out.get('blocks', [])
+
+                return _Wrapper()
+            except RuntimeError:
+                raise
             except Exception:
                 logger.exception('Failed initializing manga-ocr adapter')
+                raise
+        else:
+            msg = f"Unknown OCR backend '{backend}'. Supported: manga-ocr"
+            logger.error(msg)
+            raise RuntimeError(msg)
 
-    # Fallback to stub
-    logger.info('Falling back to OCR stub')
+    # No explicit backend: try manga-ocr; otherwise stub
+    try:
+        from .engines.manga_ocr_adapter import MangaOcrAdapter
+        adapter = MangaOcrAdapter()
+        if adapter.available():
+            logger.info('Using manga-ocr backend (device=%s)', device)
+
+            class _Wrapper:
+                def extract_text(self, image, **kwargs) -> str:
+                    pil = ocr_preprocess.qimage_to_pil(image) if not hasattr(image, 'size') else image
+                    out = adapter.recognize(pil, lang=kwargs.get('lang', 'jpn'))
+                    return out.get('text', '')
+
+                def extract_blocks(self, image, **kwargs) -> list:
+                    pil = ocr_preprocess.qimage_to_pil(image) if not hasattr(image, 'size') else image
+                    out = adapter.recognize(pil, lang=kwargs.get('lang', 'jpn'))
+                    return out.get('blocks', [])
+
+            return _Wrapper()
+    except Exception:
+        # Soft-fail: we'll fall back to stub
+        logger.debug('manga-ocr backend not available by default', exc_info=True)
+
+    logger.warning('No OCR backend available. Falling back to stub.')
     return StubOCR()

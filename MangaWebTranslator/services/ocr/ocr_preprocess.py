@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import io
 import logging
-from typing import Iterable, List
+from typing import Iterable, List, Dict, Optional
 import os
 from pathlib import Path
 from PIL import Image
@@ -17,34 +17,35 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# Rectangle type used across OCR pipeline (image-space integer coordinates)
+# Keys: left, top, width, height
+Rect = Dict[str, int]
+
 
 def qimage_to_pil(qimage) -> Image.Image:
     """Convert a PyQt6 `QImage` to a PIL `Image`.
     If the passed object is already a PIL Image, it is returned unchanged.
+
+    Note: We import PyQt types lazily to avoid making this module
+    un-importable in environments without PyQt6 (e.g., headless tests).
     """
-    # Defer import of PyQt types to avoid hard dependency at import time.
+    # Deferred import to avoid hard dependency at import time.
     try:
         from PyQt6.QtGui import QImage
     except Exception:
-        QImage = None
+        QImage = None  # type: ignore
 
-    if hasattr(qimage, 'tobytes') and hasattr(qimage, 'format') and QImage is not None and isinstance(qimage, QImage):
-        # Convert via PNG bytes to preserve alpha and color space reliably.
-        buf = qimage.bits().asstring(qimage.byteCount())
-        fmt = qimage.format()  # noqa: F841 - keep for debugging
-        try:
-            img = Image.frombuffer('RGBA', (qimage.width(), qimage.height()), buf, 'raw', 'BGRA')
-            return img.convert('RGB')
-        except Exception:
-            # Fallback to saving to bytes via QImage.save if available
-            try:
-                b = io.BytesIO()
-                qimage.save(b, 'PNG')
-                b.seek(0)
-                return Image.open(b).convert('RGB')
-            except Exception:
-                logger.exception('Failed converting QImage to PIL.Image')
-                raise
+    # QImage path
+    if QImage is not None and isinstance(qimage, QImage):
+        # Use QBuffer for in-memory conversion (PyQt6 expects QIODevice, not BytesIO)
+        from PyQt6.QtCore import QBuffer, QIODevice
+        buffer = QBuffer()
+        buffer.open(QIODevice.OpenModeFlag.ReadWrite)
+        qimage.save(buffer, 'PNG')
+        data = buffer.data()
+        buffer.close()
+        b = io.BytesIO(data)
+        return Image.open(b).convert('RGB')
 
     # Already a PIL Image
     if isinstance(qimage, Image.Image):
@@ -53,7 +54,142 @@ def qimage_to_pil(qimage) -> Image.Image:
     raise TypeError('Expected QImage or PIL.Image')
 
 
-def preprocess_for_ocr(img: Image.Image) -> Image.Image:
+def detect_text_regions(
+    img: Image.Image,
+    blur: bool = False,
+    fixed_threshold: int = 240,
+    subsume_ratio_primary: float = 0.8,
+    kernel_trials: Optional[List[tuple]] = None,
+) -> List[Rect]:
+    """Detect text-like regions and return a list of rectangle dicts.
+
+    - Returns image-space rects: {left, top, width, height}.
+    - Pure function with no UI side effects.
+    """
+    # Convert to grayscale and optionally blur to reduce noise.
+    img_np = np.array(img.convert("RGB"))
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    blurred = gray if not blur else cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Fixed thresholds (normal and inverted) are more reliable for manga panels.
+    _, th_fixed = cv2.threshold(blurred, fixed_threshold, 255, cv2.THRESH_BINARY)
+    inverse_threshold = 300 - fixed_threshold
+    _, th_fixed_inv = cv2.threshold(blurred, inverse_threshold, 255, cv2.THRESH_BINARY_INV)
+
+    def collect_filtered_rects(bin_img: np.ndarray, kernel_sizes_iters: Optional[List[tuple]]) -> List[tuple]:
+        """Run contour detection across dilation settings, returning filtered rects.
+
+        Filters favor typical text balloons/columns and remove extreme sizes.
+        """
+        # Ensure binary uint8 image (0 or 255)
+        bi = (bin_img > 0).astype(np.uint8) * 255
+
+        settings = [(1, 1, 0)]
+        if kernel_sizes_iters:
+            settings.extend(kernel_sizes_iters)
+
+        out_rects: List[tuple] = []
+        for kw, kh, iters in settings:
+            work = bi.copy()
+            if iters > 0:
+                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kw, kh))
+                work = cv2.dilate(work, kernel, iterations=iters)
+
+            # External contours to get bounding boxes
+            res = work.copy()
+            contours_info = cv2.findContours(res, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if len(contours_info) == 3:
+                _, contours, _ = contours_info
+            else:
+                contours, _ = contours_info
+
+            # Build rects and apply simple size filters
+            for c in contours:
+                x, y, w, h = cv2.boundingRect(c)
+                # Basic size heuristics; tune as needed
+                if w < 30 or h < 30:
+                    continue
+                if w > 600 or h > 600:
+                    continue
+                if (w * h) > 250000:
+                    continue
+                out_rects.append((x, y, w, h))
+
+        return out_rects
+
+    # Default kernel trials that work well on manga text columns
+    kernel_trials = kernel_trials or [(3, 5, 1), (5, 10, 2), (5, 15, 4), (7, 7, 2)]
+
+    rects_fixed = collect_filtered_rects(th_fixed, kernel_trials)
+    rects_inv = collect_filtered_rects(th_fixed_inv, kernel_trials)
+
+    # Aggregate, then suppress rects that are largely contained within bigger ones
+    flat_rects: List[tuple] = rects_fixed + rects_inv
+
+    def intersection_area(r1: tuple, r2: tuple) -> int:
+        x1, y1, w1, h1 = r1
+        x2, y2, w2, h2 = r2
+        ix1 = max(x1, x2)
+        iy1 = max(y1, y2)
+        ix2 = min(x1 + w1, x2 + w2)
+        iy2 = min(y1 + h1, y2 + h2)
+        if ix2 <= ix1 or iy2 <= iy1:
+            return 0
+        return (ix2 - ix1) * (iy2 - iy1)
+
+    final_rects: List[tuple] = []
+    for i, (x, y, w, h) in enumerate(flat_rects):
+        small_rect = (x, y, w, h)
+        small_area = w * h
+        contained = False
+        for j, (X, Y, W, H) in enumerate(flat_rects):
+            if i == j:
+                continue
+            if (W * H) <= small_area:
+                continue
+            big_rect = (X, Y, W, H)
+            inter = intersection_area(small_rect, big_rect)
+            if small_area > 0 and (inter / small_area) >= subsume_ratio_primary:
+                contained = True
+                break
+        if not contained:
+            final_rects.append(small_rect)
+
+    # Convert tuples to dicts and sort in reading order (top-left first)
+    rect_dicts: List[Rect] = [
+        {"left": int(x), "top": int(y), "width": int(w), "height": int(h)}
+        for (x, y, w, h) in final_rects
+    ]
+    rect_dicts.sort(key=lambda r: (r["top"], r["left"]))
+    return rect_dicts
+
+
+
+def crop_regions(img: Image.Image, rects: List[Rect], pad: int = 2) -> List[Image.Image]:
+    """Crop rectangular regions from the original image.
+
+    - `rects` are image-space rectangles.
+    - Adds optional padding (clamped to image bounds).
+    """
+    w_img, h_img = img.size
+    crops: List[Image.Image] = []
+    for r in rects:
+        x = max(0, r["left"] - pad)
+        y = max(0, r["top"] - pad)
+        x2 = min(w_img, r["left"] + r["width"] + pad)
+        y2 = min(h_img, r["top"] + r["height"] + pad)
+        if x2 > x and y2 > y:
+            crops.append(img.crop((x, y, x2, y2)))
+    return crops
+    
+
+
+
+
+
+
+
+def preprocess_for_ocr(img: Image.Image) -> List[tuple]:
     img_np = np.array(img.convert("RGB"))
     gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
     print("gray dtype/shape/min/max/mean:", gray.dtype, gray.shape, gray.min(), gray.max(), float(gray.mean()))
@@ -206,17 +342,9 @@ def preprocess_for_ocr(img: Image.Image) -> Image.Image:
     
     logging.warning(final_rects)
     
-    
     pil_img= Image.fromarray(cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB))
     debug_preprocess_for_ocr_display_results(pil_img, "all_filtered", precomputed_rects=final_rects)
     
-
-
-
-
-
-
-
 
 def debug_preprocess_for_ocr_display_results(img: Image.Image, name_prefix: str, precomputed_rects: List[List[tuple]]) -> Image.Image:
     """Display all detected and filtered rectangles from step_five on the original image.
@@ -245,11 +373,6 @@ def debug_preprocess_for_ocr_display_results(img: Image.Image, name_prefix: str,
             else:
                 # assume RGB
                 orig_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-        # Flatten precomputed rectangles from all settings
-        # aggregated_rects: List[tuple] = []
-        # for rect_list in precomputed_rects:
-        #     aggregated_rects.extend(rect_list)
-
         # Draw on original
         overlay = orig_bgr.copy()
         for (x, y, w, h) in precomputed_rects:
@@ -466,5 +589,5 @@ def debug_preprocess_for_ocr(img: Image.Image, out_dir: str = "_ocr_debug", show
     return None
 
 
-x= debug_preprocess_for_ocr(Image.open("_scraped_images/1.jpg"))
-x=preprocess_for_ocr(Image.open("_scraped_images/1.jpg"))
+# x= debug_preprocess_for_ocr(Image.open("_scraped_images/1.jpg"))
+# x=preprocess_for_ocr(Image.open("_scraped_images/1.jpg"))
