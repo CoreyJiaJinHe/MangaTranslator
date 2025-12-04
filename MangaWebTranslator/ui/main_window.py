@@ -1,3 +1,4 @@
+
 """Primary application window implementation.
 
 Embedded browser (PyQt6-WebEngine) with address bar, header injection,
@@ -37,7 +38,11 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QCheckBox,
 )
+
+from PyQt6.QtWidgets import QWidget, QHBoxLayout, QLabel, QLineEdit
+from PyQt6.QtWidgets import QMenu
 import json
+from PyQt6.QtWidgets import QLineEdit
 from MangaWebTranslator.ui.custom_widget.rect_preview import RectPreview
 from MangaWebTranslator.services.ocr.ocr_preprocess import qimage_to_pil, crop_regions, detect_text_regions
 from MangaWebTranslator.services.ocr.engines.manga_ocr_adapter import MangaOcrAdapter
@@ -258,6 +263,8 @@ class PanelsView(QWidget):
 
 
 class SidePanel(QWidget):
+    # Store edited block texts per panel
+    _panel_block_edits = {}
     """Right-side detail pane showing OCR text blocks and translations."""
     requestOcr = pyqtSignal(str)
     requestTranslate = pyqtSignal(str)
@@ -272,9 +279,31 @@ class SidePanel(QWidget):
         self.title.setObjectName("panelTitle")
         outer.addWidget(self.title)
 
+        # Row: Extracted Text Blocks label + top-right add (+) button
+        blocksRow = QHBoxLayout()
+        blocksRow.addWidget(QLabel("Extracted Text Blocks:"))
+        self.addBlockBtn = QPushButton("+")
+        self.addBlockBtn.setFixedSize(28, 28)
+        self.addBlockBtn.setToolTip("Add a new OCR block card")
+        blocksRow.addStretch(1)
+        blocksRow.addWidget(self.addBlockBtn)
+        outer.addLayout(blocksRow)
+
         # OCR text blocks list
         self.blocksList = QListWidget(self)
-        outer.addWidget(QLabel("Extracted Text Blocks:"))
+        # Enable drag-and-drop reordering
+        try:
+            self.blocksList.setDragDropMode(QListWidget.DragDropMode.InternalMove)
+            self.blocksList.setDefaultDropAction(Qt.DropAction.MoveAction)
+        except Exception:
+            pass
+        # Enable multi-selection: shift-click for range, control-click for individuals
+        self.blocksList.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        # Enable right-click context menu for delete
+        self.blocksList.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.blocksList.customContextMenuRequested.connect(self._showBlockContextMenu)
+        # Wire add button
+        self.addBlockBtn.clicked.connect(self._addBlock)
         outer.addWidget(self.blocksList, 2)
 
         # Place Translate beneath the blocks zone, aligned to the right
@@ -349,6 +378,52 @@ class SidePanel(QWidget):
         self.preprocChk.stateChanged.connect(lambda _: self.ocrSettingsChanged.emit())
         self.showBoxesChk.stateChanged.connect(lambda _: self.ocrSettingsChanged.emit())
 
+    def _showBlockContextMenu(self, pos):
+        item = self.blocksList.itemAt(pos)
+        if not item:
+            return
+        menu = QMenu(self)
+        delete_action = menu.addAction("Delete Block")
+        delete_selected_action = menu.addAction("Delete Selected")
+        chosen = menu.exec(self.blocksList.mapToGlobal(pos))
+        panel_id = getattr(self, 'current_panel', None)
+        if chosen is delete_action:
+            row = self.blocksList.row(item)
+            self.blocksList.takeItem(row)
+            # Keep edits cache in sync if present
+            if panel_id in self._panel_block_edits:
+                edits = self._panel_block_edits.get(panel_id, [])
+                if 0 <= row < len(edits):
+                    edits.pop(row)
+                    self._panel_block_edits[panel_id] = edits
+        elif chosen is delete_selected_action:
+            selected_items = self.blocksList.selectedItems()
+            rows = sorted([self.blocksList.row(it) for it in selected_items], reverse=True)
+            for row in rows:
+                self.blocksList.takeItem(row)
+                if panel_id in self._panel_block_edits:
+                    edits = self._panel_block_edits.get(panel_id, [])
+                    if 0 <= row < len(edits):
+                        edits.pop(row)
+                        self._panel_block_edits[panel_id] = edits
+
+    def _addBlock(self):
+        # Add a new empty editable OCR block card at the end
+        panel_id = getattr(self, 'current_panel', None)
+        w = QWidget(self.blocksList)
+        h = QHBoxLayout(w)
+        h.setContentsMargins(8, 6, 8, 6)
+        edit = QLineEdit("", w)
+        edit.setMinimumWidth(220)
+        edit.setStyleSheet("font-size: 15px; padding: 6px;")
+        h.addWidget(edit, 1)
+        item = QListWidgetItem(self.blocksList)
+        item.setSizeHint(w.sizeHint())
+        self.blocksList.addItem(item)
+        self.blocksList.setItemWidget(item, w)
+        # Persist when user finishes editing
+        idx = self.blocksList.count() - 1
+        edit.editingFinished.connect(lambda i=idx, e=edit: self._onBlockEditFinished(panel_id, i, e.text()))
     def setPanel(self, panel_id: str):
         self.current_panel = panel_id
         if panel_id:
@@ -364,26 +439,104 @@ class SidePanel(QWidget):
         if panel_id != self.current_panel:
             return
         self.blocksList.clear()
-        # Populate as simple cards (QListWidget with item widgets)
+        edited_blocks = self._panel_block_edits.get(panel_id, None)
         if not blocks:
             return
-        from PyQt6.QtWidgets import QWidget, QHBoxLayout
-        for block in blocks:
+        # Track the currently active editor (QLineEdit) and its label
+        self._active_block_editor = getattr(self, '_active_block_editor', None)
+        self._active_block_label = getattr(self, '_active_block_label', None)
+        for idx, block in enumerate(blocks):
             try:
-                text = block.get('text', '') if isinstance(block, dict) else str(block)
+                if edited_blocks and idx < len(edited_blocks):
+                    text = edited_blocks[idx]
+                else:
+                    text = block.get('text', '') if isinstance(block, dict) else str(block)
                 w = QWidget(self.blocksList)
                 h = QHBoxLayout(w)
                 h.setContentsMargins(8, 6, 8, 6)
-                lbl = QLabel(str(text))
-                lbl.setWordWrap(True)
-                h.addWidget(lbl, 1)
+                label = QLabel(str(text), w)
+                label.setStyleSheet("font-size: 15px; padding: 6px;")
+                label.setMinimumWidth(220)
+                h.addWidget(label, 1)
                 item = QListWidgetItem(self.blocksList)
                 item.setSizeHint(w.sizeHint())
                 self.blocksList.addItem(item)
                 self.blocksList.setItemWidget(item, w)
+
+                # Dedicated event filter for each label
+                class LabelEditFilter(QObject):
+                    def __init__(self, label, layout, idx, panel_id, parent_widget, sidepanel):
+                        super().__init__(label)
+                        self.label = label
+                        self.layout = layout
+                        self.idx = idx
+                        self.panel_id = panel_id
+                        self.parent_widget = parent_widget
+                        self.sidepanel = sidepanel
+                    def eventFilter(self, obj, event):
+                        if obj is self.label and event.type() == event.Type.MouseButtonDblClick:
+                            # If another editor is open, close it first
+                            if self.sidepanel._active_block_editor is not None:
+                                prev_edit = self.sidepanel._active_block_editor
+                                prev_label = self.sidepanel._active_block_label
+                                prev_layout = prev_label.parent().layout()
+                                prev_label.setText(prev_edit.text())
+                                prev_layout.removeWidget(prev_edit)
+                                prev_edit.deleteLater()
+                                prev_label.show()
+                                self.sidepanel._active_block_editor = None
+                                self.sidepanel._active_block_label = None
+                            self.layout.removeWidget(self.label)
+                            self.label.hide()
+                            edit = QLineEdit(self.label.text(), self.parent_widget)
+                            edit.setMinimumWidth(220)
+                            edit.setStyleSheet("font-size: 15px; padding: 6px;")
+                            self.layout.addWidget(edit, 1)
+                            edit.setFocus()
+                            self.sidepanel._active_block_editor = edit
+                            self.sidepanel._active_block_label = self.label
+                            def finish_edit():
+                                self.sidepanel._onBlockEditFinished(self.panel_id, self.idx, edit.text())
+                                self.label.setText(edit.text())
+                                self.layout.removeWidget(edit)
+                                edit.deleteLater()
+                                self.label.show()
+                                self.sidepanel._active_block_editor = None
+                                self.sidepanel._active_block_label = None
+                            edit.editingFinished.connect(finish_edit)
+                            return True
+                        return False
+
+                filter_obj = LabelEditFilter(label, h, idx, panel_id, w, self)
+                label.installEventFilter(filter_obj)
             except Exception:
-                # Fallback to plain text item if widget setup fails
                 QListWidgetItem(str(text), self.blocksList)
+
+    class EditOnDoubleClickFilter(QObject):
+        """Event filter to enable editing on double-click for QLineEdit."""
+        def __init__(self, line_edit):
+            super().__init__(line_edit)
+            self.line_edit = line_edit
+        def eventFilter(self, obj, event):
+            if obj is self.line_edit and event.type() == event.Type.MouseButtonDblClick:
+                self.line_edit.setReadOnly(False)
+                self.line_edit.setFocus()
+                return True
+            return False
+
+    def _onBlockEditFinished(self, panel_id: str, idx: int, new_text: str):
+        # Update the edited block text for this panel and index
+        edits = self._panel_block_edits.get(panel_id, [])
+        # Ensure the list is long enough
+        while len(edits) <= idx:
+            edits.append("")
+        edits[idx] = new_text
+        self._panel_block_edits[panel_id] = edits
+
+    def _onBlockEdited(self, panel_id: str):
+        # Save all current block texts for this panel
+        texts = [self.blocksList.item(i).text() for i in range(self.blocksList.count())]
+        self._panel_block_edits[panel_id] = texts
 
     def getOcrSettings(self) -> dict:
         """Return current OCR settings as a dict."""
@@ -789,26 +942,31 @@ class MainWindow(QMainWindow):
         try:
             st = self.sidePanel.getOcrSettings()
             lang = st.get('lang', 'jpn')
+            conf_thresh = int(st.get('conf_thresh', 0) or 0)
+            preprocess = bool(st.get('preprocess', True))
         except Exception:
             lang = 'jpn'
+            conf_thresh = 240
+            preprocess = True
         # Start OCR in a background thread
         self._ocr_thread = QThread()
-        # Pass preloaded OCR adapter as third argument, lang as fourth
-        self._ocr_worker = OcrWorker(panel_id, crops, adapter, lang)
+        
+        items = [(panel_id, crops)]
+        self._ocr_worker = OcrWorker(items, lang, adapter, conf_thresh, preprocess=preprocess)
         self._ocr_worker.moveToThread(self._ocr_thread)
         self._ocr_thread.started.connect(self._ocr_worker.run)
-        def on_finished(panel_id, texts):
+        def on_item_finished(panel_id, texts):
             self.sidePanel.setOcrBlocks(panel_id, texts)
             self._ocr_thread.quit()
             self._ocr_worker.deleteLater()
             self._ocr_thread.deleteLater()
-        def on_error(msg):
+        def on_error(panel_id, msg):
             show_selectable_message(self, "OCR", f"OCR failed: {msg}", QMessageBox.Icon.Warning)
             self._ocr_thread.quit()
             self._ocr_worker.deleteLater()
             self._ocr_thread.deleteLater()
-        self._ocr_worker.finished.connect(on_finished)
-        self._ocr_worker.error.connect(on_error)
+        self._ocr_worker.itemFinished.connect(on_item_finished)
+        self._ocr_worker.itemError.connect(on_error)
         self._ocr_thread.start()
 
     def _ocr_all_panels_regions(self):
@@ -989,8 +1147,10 @@ class MainWindow(QMainWindow):
         except Exception:
             lang, conf, pre = 'jpn', 0, True
 
+        # Use preloaded adapter
+        adapter = self._ocr_adapter
         # Batch worker + thread
-        worker = OcrWorker(items, lang=lang, conf_thresh=conf, preprocess=pre)
+        worker = OcrWorker(items, lang=lang, adapter=adapter, conf_thresh=conf, preprocess=pre)
         thread = QThread(self)
         worker.moveToThread(thread)
 
@@ -1006,7 +1166,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         try:
-            worker.itemError.connect(_collect_item_error)
+            worker.error.connect(_collect_item_error)
         except Exception:
             pass
         worker.progress.connect(lambda done, total: progress.setValue(done))
@@ -2082,8 +2242,8 @@ class OcrWorker(QObject):
     """Worker that performs OCR on one or more panels in a background QThread.
 
     Emits:
-        - itemFinished(panel_id, blocks): for each panel processed
-        - itemError(panel_id, errmsg): for per-panel errors
+        - finished(panel_id, blocks): for each panel processed
+        - error(panel_id, errmsg): for per-panel errors
         - progress(done, total): after each panel
         - finished(done): when all panels are done
     """
@@ -2092,13 +2252,23 @@ class OcrWorker(QObject):
     progress = pyqtSignal(int, int)
     finished = pyqtSignal(int)
 
-    def __init__(self, items, ocr_engine=None, lang: str = 'jpn', conf_thresh: int = 0, preprocess: bool = True):
+    def __init__(self, items, lang: str = 'jpn', ocr_engine=None, conf_thresh: int = 0, preprocess: bool = True):
         """
-        items: list of (panel_id, crops) or (panel_id, QImage)
+        items: list of (panel_id, crops) or (panel_id, QImage), or a single tuple
         ocr_engine: preloaded OCR engine (optional, for single-panel use)
         """
         super().__init__()
-        self._items = items if isinstance(items, list) else [items]
+        # Normalize input to always be a list of (panel_id, crops) tuples
+        if isinstance(items, tuple) and len(items) == 2:
+            self._items = [items]
+        elif isinstance(items, list):
+            # If it's a list of crops/images, treat as single panel
+            if items and not (isinstance(items[0], tuple) and len(items[0]) == 2):
+                self._items = [('panel', items)]  # Use a dummy panel_id if not provided
+            else:
+                self._items = items
+        else:
+            raise ValueError("OcrWorker items must be a tuple or list")
         self.ocr_engine = ocr_engine
         self.lang = lang
         self.conf_thresh = conf_thresh
@@ -2118,7 +2288,12 @@ class OcrWorker(QObject):
         if ocr is None:
             from MangaWebTranslator.services.ocr.ocr_adapter import create_ocr
             ocr = create_ocr()
-        for panel_id, crops in self._items:
+        for item in self._items:
+            # Defensive unpacking
+            if isinstance(item, tuple) and len(item) == 2:
+                panel_id, crops = item
+            else:
+                panel_id, crops = 'panel', item
             if self._cancel:
                 break
             try:
