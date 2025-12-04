@@ -67,6 +67,7 @@ def create_ocr(cfg: Dict | None = None):
                     def extract_blocks(self, image, **kwargs) -> list:
                         pil = ocr_preprocess.qimage_to_pil(image) if not hasattr(image, 'size') else image
                         out = adapter.recognize(pil, lang=kwargs.get('lang', 'jpn'))
+                        logging.debug('OCR blocks: %s', out.get('blocks', []))
                         return out.get('blocks', [])
 
                 return _Wrapper()
@@ -96,6 +97,7 @@ def create_ocr(cfg: Dict | None = None):
                 def extract_blocks(self, image, **kwargs) -> list:
                     pil = ocr_preprocess.qimage_to_pil(image) if not hasattr(image, 'size') else image
                     out = adapter.recognize(pil, lang=kwargs.get('lang', 'jpn'))
+                    logging.debug('OCR blocks: %s', out.get('blocks', []))
                     return out.get('blocks', [])
 
             return _Wrapper()

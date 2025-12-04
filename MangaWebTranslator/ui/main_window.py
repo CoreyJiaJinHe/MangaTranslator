@@ -1,4 +1,3 @@
-
 """Primary application window implementation.
 
 Embedded browser (PyQt6-WebEngine) with address bar, header injection,
@@ -12,6 +11,7 @@ from __future__ import annotations
 import torch
 from typing import List, Optional
 import os
+import logging  # Added to enable logging.warning usage
 from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot, QSize, QThread, QObject, QUrl, QTimer
 from PyQt6.QtGui import QAction, QPixmap, QIcon
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
@@ -41,6 +41,8 @@ import json
 from MangaWebTranslator.ui.custom_widget.rect_preview import RectPreview
 from MangaWebTranslator.services.ocr.ocr_preprocess import qimage_to_pil, crop_regions, detect_text_regions
 from MangaWebTranslator.services.ocr.engines.manga_ocr_adapter import MangaOcrAdapter
+from PyQt6.QtCore import QThread, pyqtSignal, QObject
+
 
 def show_selectable_message(parent, title, text, icon=QMessageBox.Icon.Information):
     dlg = QMessageBox(parent)
@@ -358,7 +360,7 @@ class SidePanel(QWidget):
         self.dictEdit.clear()
         self.similarityList.clear()
 
-    def setOcrBlocks(self, panel_id: str, blocks: List[str]):
+    def setOcrBlocks(self, panel_id: str, blocks: List):
         if panel_id != self.current_panel:
             return
         self.blocksList.clear()
@@ -366,8 +368,9 @@ class SidePanel(QWidget):
         if not blocks:
             return
         from PyQt6.QtWidgets import QWidget, QHBoxLayout
-        for text in blocks:
+        for block in blocks:
             try:
+                text = block.get('text', '') if isinstance(block, dict) else str(block)
                 w = QWidget(self.blocksList)
                 h = QHBoxLayout(w)
                 h.setContentsMargins(8, 6, 8, 6)
@@ -474,6 +477,11 @@ class SidePanel(QWidget):
 
 
 class MainWindow(QMainWindow):
+    def _onRectsChanged(self, rects):
+        # Update rectangles for the current panel when changed in the preview
+        panel_id = getattr(self.sidePanel, 'current_panel', None)
+        if panel_id:
+            self._panel_rects[panel_id] = rects.copy()
     """Main application window with panel grid and detail side panel."""
 
     panelSelected = pyqtSignal(str)
@@ -488,6 +496,16 @@ class MainWindow(QMainWindow):
         self._createToolbar()
         self._createLayout()
         self._connectSignals()
+        # Connect rectsChanged from preview to keep per-panel rectangles in sync
+        try:
+            self.panelGrid.preview.rectsChanged.connect(self._onRectsChanged)
+        except Exception:
+            pass
+        # Preload MangaOcrAdapter once for all OCR calls
+        from MangaWebTranslator.services.ocr.ocr_adapter import create_ocr
+        self._ocr_adapter = create_ocr()
+        # Store rectangles per panel_id
+        self._panel_rects = {}  # panel_id -> list of rects
         # Load persisted config and apply OCR settings (creates config file if missing)
         try:
             cfg = self._load_config()
@@ -495,6 +513,8 @@ class MainWindow(QMainWindow):
             self.sidePanel.setOcrSettings(ocr_cfg)
         except Exception:
             pass
+        # Debug: load images on startup
+        self.debug_on_startup()
 
     # ----------------------- UI Construction -----------------------
     def _createActions(self):
@@ -687,6 +707,25 @@ class MainWindow(QMainWindow):
             self.panelGrid.preview.update()
         except Exception:
             pass
+    
+    
+    def debug_on_startup(self):
+        """Debug: Load three images from _scraped_images/ (1.jpg, 2.jpg, 3.jpg) at startup."""
+        import os
+        img_dir = os.path.abspath("_scraped_images")
+        img_names = ["1.jpg", "2.jpg", "3.jpg"]
+        loaded = 0
+        for name in img_names:
+            path = os.path.join(img_dir, name)
+            if os.path.exists(path):
+                pm = QPixmap(path)
+                if not pm.isNull():
+                    panel_id = os.path.basename(path)
+                    self.panelGrid.addPanel(panel_id, pm)
+                    loaded += 1
+        if loaded:
+            show_info_message(self, "Debug Load", f"Loaded {loaded} debug image(s) from _scraped_images.")
+            self._ensureGridVisible()
 
     # ----------------------- Actions -----------------------
     def _onLoadImages(self):
@@ -700,27 +739,38 @@ class MainWindow(QMainWindow):
             panel_id = os.path.basename(fp)
             self.panelGrid.addPanel(panel_id, pm)
         show_info_message(self, "Load", f"Loaded {len(files)} image(s).")
+        # Switch to panels view after loading images
+        self._ensureGridVisible()
 
     def _onPanelSelected(self, panel_id: str):
         self.sidePanel.setPanel(panel_id)
+        # When a panel is selected, update the preview with its rectangles
+        rects = self._panel_rects.get(panel_id, [])
+        self.panelGrid.showOcrOverlay(panel_id, rects)
         self.panelSelected.emit(panel_id)
 
-    def _onRequestOcr(self, panel_id: str):
-        """Crop selected regions and run manga-ocr on each; display raw text as cards."""
+    def _onRequestOcr(self, _panel_id: str):
+        """OCR only selected panels' regions; if none selected, OCR the currently previewing panel."""
+        # Get selected panels, or fallback to current panel
+        if hasattr(self.panelGrid, 'selectedPanelIds'):
+            sel = self.panelGrid.selectedPanelIds()
+        else:
+            sel = []
+        panel_ids = sel if sel else [self.sidePanel.current_panel]
+        if not panel_ids or not panel_ids[0]:
+            show_info_message(self, "OCR", "No panel selected.")
+            return
+        # Only OCR the first panel in the list (button is for single-panel OCR)
+        panel_id = panel_ids[0]
         pm = getattr(self.panelGrid, '_pixmaps', {}).get(panel_id)
         if not pm:
             show_info_message(self, "OCR", f"Panel not found: {panel_id}")
             return
-
-        # Get curated rectangles from the interactive preview
-        try:
-            rects = self.panelGrid.preview.getRects()
-        except Exception:
-            rects = []
+        # Use stored rectangles for this panel
+        rects = self._panel_rects.get(panel_id, [])
         if not rects:
             show_info_message(self, "OCR", "No regions selected. Run Detect Regions or draw rectangles.")
             return
-
         # Convert to PIL.Image
         try:
             qimg = pm.toImage()
@@ -728,45 +778,62 @@ class MainWindow(QMainWindow):
         except Exception as e:
             show_selectable_message(self, "OCR", f"Failed to prepare image: {e}", QMessageBox.Icon.Warning)
             return
-
         # Crop regions
         try:
             crops = crop_regions(pil_img, rects, pad=2)
         except Exception as e:
             show_selectable_message(self, "OCR", f"Cropping failed: {e}", QMessageBox.Icon.Warning)
             return
-
-        # Prepare manga-ocr adapter
-        try:
-            adapter = MangaOcrAdapter()
-        except Exception as e:
-            show_selectable_message(self, "OCR", f"OCR adapter init failed: {e}", QMessageBox.Icon.Warning)
-            return
-
-        texts: list[str] = []
+        # Use preloaded adapter
+        adapter = self._ocr_adapter
         try:
             st = self.sidePanel.getOcrSettings()
             lang = st.get('lang', 'jpn')
         except Exception:
             lang = 'jpn'
-        for crop in crops:
-            try:
-                res = adapter.recognize(crop, lang=lang)
-                t = (res or {}).get('text', '')
-                if t:
-                    texts.append(t)
-            except Exception as e:
-                # Continue with other crops; collect non-empty results only
-                continue
-
-        if not texts:
-            show_info_message(self, "OCR", "No text detected in selected regions.")
-            return
-
-        # Display texts as cards in the side panel
-        try:
+        # Start OCR in a background thread
+        self._ocr_thread = QThread()
+        # Pass preloaded OCR adapter as third argument, lang as fourth
+        self._ocr_worker = OcrWorker(panel_id, crops, adapter, lang)
+        self._ocr_worker.moveToThread(self._ocr_thread)
+        self._ocr_thread.started.connect(self._ocr_worker.run)
+        def on_finished(panel_id, texts):
             self.sidePanel.setOcrBlocks(panel_id, texts)
-        except Exception:
+            self._ocr_thread.quit()
+            self._ocr_worker.deleteLater()
+            self._ocr_thread.deleteLater()
+        def on_error(msg):
+            show_selectable_message(self, "OCR", f"OCR failed: {msg}", QMessageBox.Icon.Warning)
+            self._ocr_thread.quit()
+            self._ocr_worker.deleteLater()
+            self._ocr_thread.deleteLater()
+        self._ocr_worker.finished.connect(on_finished)
+        self._ocr_worker.error.connect(on_error)
+        self._ocr_thread.start()
+
+    def _ocr_all_panels_regions(self):
+        """
+        Not exposed: OCR all loaded panels' regions. For future batch OCR feature.
+        """
+        for panel_id, pm in getattr(self.panelGrid, '_pixmaps', {}).items():
+            rects = self._panel_rects.get(panel_id, [])
+            if not rects:
+                continue
+            try:
+                qimg = pm.toImage()
+                pil_img = qimage_to_pil(qimg)
+                crops = crop_regions(pil_img, rects, pad=2)
+            except Exception:
+                continue
+            adapter = self._ocr_adapter
+            try:
+                st = self.sidePanel.getOcrSettings()
+                lang = st.get('lang', 'jpn')
+            except Exception:
+                lang = 'jpn'
+            # This is a placeholder for future batch threading/aggregation logic
+            # For now, just a stub for future work
+            # Example: texts = [adapter.recognize(crop, lang=lang) for crop in crops]
             pass
 
     def _onRequestTranslate(self, panel_id: str):
@@ -774,12 +841,18 @@ class MainWindow(QMainWindow):
         translated = "(EN) " + "; ".join(["example", "sample", "test"])
         self.translationCompleted.emit(panel_id, translated)
 
-    def _onRequestDetectRegions(self, panel_id: str):
-        """Run backend text-region detection for the given panel and overlay results.
-
-        Uses fixed defaults for now (threshold=240, blur toggled by "Preprocess").
-        Rectangles are shown in the preview for user curation (add/remove/multi-select).
-        """
+    def _onRequestDetectRegions(self, _panel_id: str):
+        """Detect regions for selected panels, or current if none selected."""
+        if hasattr(self.panelGrid, 'selectedPanelIds'):
+            sel = self.panelGrid.selectedPanelIds()
+        else:
+            sel = []
+        panel_ids = sel if sel else [self.sidePanel.current_panel]
+        if not panel_ids or not panel_ids[0]:
+            show_info_message(self, "Detect Regions", "No panel selected.")
+            return
+        # Only process the first panel for now (single-panel detect)
+        panel_id = panel_ids[0]
         pm = getattr(self.panelGrid, '_pixmaps', {}).get(panel_id)
         if pm is None or pm.isNull():
             show_info_message(self, "Detect Regions", "No image for the selected panel.")
@@ -809,7 +882,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             show_selectable_message(self, "Detect Regions", f"Detection failed: {e}", QMessageBox.Icon.Warning)
             return
-        # Overlay rectangles in the interactive preview
+        # Overlay rectangles in the interactive preview and store them
         try:
             self.previewDetectedRegions(panel_id, rects)
         except Exception:
@@ -847,21 +920,14 @@ class MainWindow(QMainWindow):
 
     # ----------------------- Region Detection (GUI stubs) -----------------------
     def previewDetectedRegions(self, panel_id: str, rects: list[dict]) -> None:
-        """Preview detected regions as overlay boxes on the panel preview.
-
-        This is a non-invasive hook to visualize rectangles returned from
-        backend detection (e.g., detect_text_regions). The rectangles are
-        expected to be image-space coordinates with keys: left, top, width, height.
-
-        Wiring the actual call to the backend and adding interactive editing
-        (add/remove/multi-select) will be done later.
-        """
+        """Preview detected regions as overlay boxes on the panel preview, and store per-panel rectangles."""
         if not rects or not isinstance(rects, list):
             return
+        # Store rectangles for this panel
+        self._panel_rects[panel_id] = rects.copy()
         try:
             self.panelGrid.showOcrOverlay(panel_id, rects)
         except Exception:
-            # Overlay drawing is best-effort; ignore errors to keep UI responsive.
             pass
 
     def beginRegionSelection(self, panel_id: str) -> None:
@@ -876,8 +942,10 @@ class MainWindow(QMainWindow):
         avoid touching broader UI logic now.
         """
         try:
-            # Placeholder: ensure the side panel reflects the current panel
             self.sidePanel.setPanel(panel_id)
+            # When switching panels, update the preview with the correct rectangles
+            rects = self._panel_rects.get(panel_id, [])
+            self.panelGrid.showOcrOverlay(panel_id, rects)
         except Exception:
             pass
 
@@ -922,7 +990,7 @@ class MainWindow(QMainWindow):
             lang, conf, pre = 'jpn', 0, True
 
         # Batch worker + thread
-        worker = OcrBatchWorker(items, lang=lang, conf_thresh=conf, preprocess=pre)
+        worker = OcrWorker(items, lang=lang, conf_thresh=conf, preprocess=pre)
         thread = QThread(self)
         worker.moveToThread(thread)
 
@@ -1780,7 +1848,9 @@ class AsyncImageDownloadWorker(QObject):
         self._index += 1
         QTimer.singleShot(0, self._start_next)
 
+   
     def _on_fallback_failed(self, url: str, errmsg: str):
+
         try:
             self._errors += 1
             self.itemError.emit(url, f'Fallback failed: {errmsg}')
@@ -1939,11 +2009,6 @@ class AsyncImagePreviewer(QObject):
                             else:
                                 self.ready.emit(pm)
                         except Exception as e:
-                            try:
-                                import traceback
-                                traceback.print_exc()
-                            except Exception:
-                                pass
                             self.failed.emit(str(e))
                         finally:
                             self.finished.emit()
@@ -2011,57 +2076,30 @@ class AsyncImagePreviewer(QObject):
         self.finished.emit()
 
 
+
+# Unified OcrWorker: handles both single-panel (multi-crop) and batch (multi-panel) OCR
 class OcrWorker(QObject):
-    """Worker that performs OCR on a single panel image in a background QThread.
+    """Worker that performs OCR on one or more panels in a background QThread.
 
-    Emits `finished(panel_id, blocks_list)` or `error(panel_id, errmsg)`.
-    """
-    finished = pyqtSignal(str, list)
-    error = pyqtSignal(str, str)
-
-    def __init__(self, panel_id: str, qimage, lang: str = 'jpn', conf_thresh: int = 0, preprocess: bool = True):
-        super().__init__()
-        self.panel_id = panel_id
-        self.qimage = qimage
-        self.lang = lang
-        self.conf_thresh = conf_thresh
-        self.preprocess = preprocess
-        self._cancel = False
-
-    @pyqtSlot()
-    def run(self):
-        # Add verbose debugging to help diagnose silent failures (conversion, pytesseract errors)
-        try:
-            import traceback
-            print(f"[OCR] Starting OCR for {self.panel_id} (lang={self.lang} preprocess={self.preprocess} conf={self.conf_thresh})")
-            from services.ocr.ocr_adapter import create_ocr
-            ocr = create_ocr()
-            blocks = ocr.extract_blocks(self.qimage, lang=self.lang, preprocess=self.preprocess, conf_thresh=self.conf_thresh)
-            print(f"[OCR] Completed for {self.panel_id}: found {len(blocks)} blocks")
-            # Emit structured blocks (list[dict]) so UI can show boxes + text
-            self.finished.emit(self.panel_id, blocks)
-        except Exception as e:
-            try:
-                import traceback
-                traceback.print_exc()
-            except Exception:
-                pass
-            self.error.emit(self.panel_id, str(e))
-
-
-class OcrBatchWorker(QObject):
-    """Sequential OCR worker for a list of (panel_id, QImage).
-
-    Emits `itemFinished(panel_id, blocks)`, `progress(done, total)`, and `finished(done)`.
+    Emits:
+        - itemFinished(panel_id, blocks): for each panel processed
+        - itemError(panel_id, errmsg): for per-panel errors
+        - progress(done, total): after each panel
+        - finished(done): when all panels are done
     """
     itemFinished = pyqtSignal(str, list)
     itemError = pyqtSignal(str, str)
     progress = pyqtSignal(int, int)
     finished = pyqtSignal(int)
 
-    def __init__(self, items: list, lang: str = 'jpn', conf_thresh: int = 0, preprocess: bool = True):
+    def __init__(self, items, ocr_engine=None, lang: str = 'jpn', conf_thresh: int = 0, preprocess: bool = True):
+        """
+        items: list of (panel_id, crops) or (panel_id, QImage)
+        ocr_engine: preloaded OCR engine (optional, for single-panel use)
+        """
         super().__init__()
-        self._items = items
+        self._items = items if isinstance(items, list) else [items]
+        self.ocr_engine = ocr_engine
         self.lang = lang
         self.conf_thresh = conf_thresh
         self.preprocess = preprocess
@@ -2072,36 +2110,52 @@ class OcrBatchWorker(QObject):
 
     @pyqtSlot()
     def run(self):
+        import traceback
         done = 0
         total = len(self._items)
-        try:
-            import traceback
-            from services.ocr.ocr_adapter import create_ocr
+        # Use provided ocr_engine or create one (for batch)
+        ocr = self.ocr_engine
+        if ocr is None:
+            from MangaWebTranslator.services.ocr.ocr_adapter import create_ocr
             ocr = create_ocr()
-            for panel_id, qimage in self._items:
-                if self._cancel:
-                    break
+        for panel_id, crops in self._items:
+            if self._cancel:
+                break
+            try:
+                # Accept either a single image or a list of crops
+                crop_list = crops if isinstance(crops, list) else [crops]
+                print(f"[OCR] OCRing {panel_id} with {len(crop_list)} crops (lang={self.lang} preprocess={self.preprocess} conf={self.conf_thresh})")
+                results = []
+                for idx, crop in enumerate(crop_list):
+                    print(f"[OCR] Crop {idx+1} type: {type(crop).__name__}")
+                    if not hasattr(ocr, 'extract_blocks'):
+                        print("[OCR] ERROR: Provided ocr_engine does not have extract_blocks method.")
+                        results.append([])
+                        continue
+                    if not (hasattr(crop, 'size') or hasattr(crop, 'width')):
+                        print(f"[OCR] WARNING: Crop {idx+1} is not an image. Value: {crop}")
+                    try:
+                        blocks = ocr.extract_blocks(crop, lang=self.lang, preprocess=self.preprocess, conf_thresh=self.conf_thresh)
+                        results.append(blocks)
+                    except Exception as e:
+                        print(f"[OCR] Error in crop {idx+1}: {e}")
+                        try:
+                            traceback.print_exc()
+                        except Exception:
+                            pass
+                        results.append([])
+                # Flatten results for display logic
+                flat_results = [block for blocks in results for block in blocks]
+                self.itemFinished.emit(panel_id, flat_results)
+            except Exception as e:
                 try:
-                    print(f"[OCR-Batch] OCRing {panel_id} (lang={self.lang} preprocess={self.preprocess} conf={self.conf_thresh})")
-                    blocks = ocr.extract_blocks(qimage, lang=self.lang, preprocess=self.preprocess, conf_thresh=self.conf_thresh)
-                    print(f"[OCR-Batch] {panel_id}: found {len(blocks)} blocks")
-                except Exception as e:
-                    try:
-                        traceback.print_exc()
-                    except Exception:
-                        pass
-                    blocks = []
-                    # notify caller of per-item error
-                    try:
-                        self.itemError.emit(panel_id, str(e))
-                    except Exception:
-                        pass
-                done += 1
-                # Emit the structured blocks (or empty list on error) so UI can show boxes + text
-                self.itemFinished.emit(panel_id, blocks)
-                self.progress.emit(done, total)
-        finally:
-            self.finished.emit(done)
+                    traceback.print_exc()
+                except Exception:
+                    pass
+                self.itemError.emit(panel_id, str(e))
+            done += 1
+            self.progress.emit(done, total)
+        self.finished.emit(done)
 
 def create_app_window() -> MainWindow:
     """Factory to create the fully constructed MainWindow."""
