@@ -54,6 +54,7 @@ class RectPreview(QWidget):
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.DefaultContextMenu)
         self._show_boxes: bool = True
         self._interaction_enabled: bool = True
+        self._panel_id: str = ""
 
     # -------- Public API --------
     def setPixmap(self, pm: QPixmap) -> None:
@@ -61,17 +62,22 @@ class RectPreview(QWidget):
         self._pixmap = pm
         self.update()
 
-    def setRects(self, rects: list[dict]) -> None:
-        """Replace existing rectangles with the provided list (image-space)."""
+    def setRects(self, rects: list[dict], panel_id: Optional[str] = None) -> None:
+        """Replace existing rectangles with the provided list (image-space). Assign IDs as panel_id + crop_idx."""
+        if panel_id is not None:
+            self._panel_id = panel_id
         self._rects = []
-        for r in (rects or []):
+        for idx, r in enumerate(rects or []):
             try:
-                self._rects.append({
+                rect = {
                     'left': int(r.get('left', 0)),
                     'top': int(r.get('top', 0)),
                     'width': int(r.get('width', 0)),
                     'height': int(r.get('height', 0)),
-                })
+                }
+                # Assign ID as panel_id + crop_idx
+                rect['id'] = r.get('id', f"{self._panel_id}_{idx}")
+                self._rects.append(rect)
             except Exception:
                 continue
         self._selected.clear()
@@ -174,6 +180,14 @@ class RectPreview(QWidget):
             for i, r in enumerate(self._rects):
                 x, y, rw, rh = self._image_rect_to_widget(r)
                 painter.drawRect(x, y, rw, rh)
+                # Draw rectangle number at top-left corner of the box
+                painter.setPen(QPen(QColor(255, 255, 255)))
+                font = painter.font()
+                font.setBold(True)
+                font.setPointSize(12)
+                painter.setFont(font)
+                painter.drawText(x + 4, y + 18, str(i + 1))
+                painter.setPen(pen)
                 # Selected highlight
                 if i in self._selected:
                     sel_pen = QPen(QColor(255, 255, 0))
@@ -326,7 +340,9 @@ class RectPreview(QWidget):
                     i_t = max(0, min(i_t, ph - 1))
                     i_w = max(1, min(i_w, pw - i_l))
                     i_h = max(1, min(i_h, ph - i_t))
-                    self._rects.append({'left': i_l, 'top': i_t, 'width': i_w, 'height': i_h})
+                    crop_idx = len(self._rects)
+                    rect_id = f"{self._panel_id}_{crop_idx}"
+                    self._rects.append({'left': i_l, 'top': i_t, 'width': i_w, 'height': i_h, 'id': rect_id})
                     self.rectsChanged.emit(self._rects.copy())
                 # Reset draw state
                 self._draw_active = False

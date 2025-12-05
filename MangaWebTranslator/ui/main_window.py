@@ -1,4 +1,3 @@
-
 """Primary application window implementation.
 
 Embedded browser (PyQt6-WebEngine) with address bar, header injection,
@@ -8,7 +7,6 @@ Selenium support removed: embedded browser is now the sole navigation mechanism.
 If PyQt6-WebEngine is missing, a placeholder widget informs the user.
 """
 from __future__ import annotations
-
 import torch
 from typing import List, Optional
 import os
@@ -37,16 +35,16 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QSpinBox,
     QCheckBox,
+    QWidget,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMenu
 )
-
-from PyQt6.QtWidgets import QWidget, QHBoxLayout, QLabel, QLineEdit
-from PyQt6.QtWidgets import QMenu
 import json
-from PyQt6.QtWidgets import QLineEdit
 from MangaWebTranslator.ui.custom_widget.rect_preview import RectPreview
 from MangaWebTranslator.services.ocr.ocr_preprocess import qimage_to_pil, crop_regions, detect_text_regions
-from MangaWebTranslator.services.ocr.engines.manga_ocr_adapter import MangaOcrAdapter
-from PyQt6.QtCore import QThread, pyqtSignal, QObject
+
 
 
 def show_selectable_message(parent, title, text, icon=QMessageBox.Icon.Information):
@@ -56,13 +54,15 @@ def show_selectable_message(parent, title, text, icon=QMessageBox.Icon.Informati
     dlg.setIcon(icon)
     dlg.setStandardButtons(QMessageBox.StandardButton.Ok)
     dlg.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
+    dlg.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+    dlg.activateWindow()
     dlg.exec()
 
 def show_info_message(parent, title, text):
     # Single helper for informational dialogs; selectable text for easy copying
     show_selectable_message(parent, title, text, QMessageBox.Icon.Information)
 
-class PanelCard(QWidget):
+class PanelImageThumbnailCard(QWidget):
     """Visual card representing a manga panel image.
 
     Displays the image (scaled) and stores an identifier used for
@@ -93,30 +93,8 @@ class PanelCard(QWidget):
         super().mousePressEvent(event)
 
 
-class PanelGrid(QScrollArea):
-    """Scrollable grid of ``PanelCard`` instances."""
-    panelSelected = pyqtSignal(str)
 
-    def __init__(self, parent: Optional[QWidget] = None):
-        super().__init__(parent)
-        self._container = QWidget(self)
-        self._layout = QGridLayout(self._container)
-        self._layout.setSpacing(8)
-        self._layout.setContentsMargins(8, 8, 8, 8)
-        self.setWidget(self._container)
-        self.setWidgetResizable(True)
-        self._cards: List[PanelCard] = []
-
-    def addPanel(self, panel_id: str, pixmap: QPixmap):
-        card = PanelCard(panel_id, pixmap, self._container)
-        card.clicked.connect(self.panelSelected)
-        position = len(self._cards)
-        row, col = divmod(position, 4)  # 4 columns for now
-        self._layout.addWidget(card, row, col)
-        self._cards.append(card)
-
-
-class PanelsView(QWidget):
+class PanelsChapterImagesPreview(QWidget):
     """Vertical list of panels on the left and a larger preview on the right.
 
     Keeps a `_cards` list of panel ids for compatibility with existing code.
@@ -257,12 +235,13 @@ class PanelsView(QWidget):
             return
         # Forward rectangles to interactive preview; it will render/scaling.
         try:
-            self.preview.setRects(blocks)
+            # Pass panel_id so RectPreview assigns IDs as panel_id+idx
+            self.preview.setRects(blocks, panel_id=panel_id)
         except Exception:
             pass
 
 
-class SidePanel(QWidget):
+class RightSidePanel(QWidget):
     # Store edited block texts per panel
     _panel_block_edits = {}
     """Right-side detail pane showing OCR text blocks and translations."""
@@ -273,6 +252,8 @@ class SidePanel(QWidget):
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
+        # Store a direct reference to MainWindow for rectangle sync
+        self.main_window = parent if isinstance(parent, QMainWindow) else None
         outer = QVBoxLayout(self)
 
         self.title = QLabel("No panel selected")
@@ -315,9 +296,10 @@ class SidePanel(QWidget):
 
         # Translation output
         outer.addWidget(QLabel("Translation:"))
-        self.translationEdit = QTextEdit(self)
-        self.translationEdit.setReadOnly(True)
-        outer.addWidget(self.translationEdit, 1)
+        # Translation output as cards
+        self.translationList = QListWidget(self)
+        self.translationList.setSelectionMode(QListWidget.SelectionMode.NoSelection)
+        outer.addWidget(self.translationList, 1)
 
         # Dictionary / similarity placeholders
         outer.addWidget(QLabel("Dictionary Lookup (stub):"))
@@ -389,6 +371,8 @@ class SidePanel(QWidget):
         panel_id = getattr(self, 'current_panel', None)
         if chosen is delete_action:
             row = self.blocksList.row(item)
+            widget = self.blocksList.itemWidget(item)
+            block_id = getattr(widget, 'block_id', None) if widget else None
             self.blocksList.takeItem(row)
             # Keep edits cache in sync if present
             if panel_id in self._panel_block_edits:
@@ -396,16 +380,45 @@ class SidePanel(QWidget):
                 if 0 <= row < len(edits):
                     edits.pop(row)
                     self._panel_block_edits[panel_id] = edits
+            # Remove the corresponding rectangle using direct main_window reference
+            mw = self.main_window
+            if mw and hasattr(mw, '_panel_rects') and block_id:
+                rects = mw._panel_rects.get(panel_id, [])
+                new_rects = [r for r in rects if r.get('id') != block_id]
+                mw._panel_rects[panel_id] = new_rects
+                # Update the preview
+                if hasattr(mw.panelGrid, 'showOcrOverlay'):
+                    mw.panelGrid.showOcrOverlay(panel_id, new_rects)
+            # Renumber block card labels only (preserve text)
+            self.renumberBlockCardLabels()
         elif chosen is delete_selected_action:
             selected_items = self.blocksList.selectedItems()
-            rows = sorted([self.blocksList.row(it) for it in selected_items], reverse=True)
-            for row in rows:
+            rows_and_block_ids = []
+            for it in selected_items:
+                row = self.blocksList.row(it)
+                widget = self.blocksList.itemWidget(it)
+                block_id = getattr(widget, 'block_id', None) if widget else None
+                rows_and_block_ids.append((row, block_id))
+            # Remove selected items from blocksList and edits cache
+            for row, _ in sorted(rows_and_block_ids, reverse=True):
                 self.blocksList.takeItem(row)
                 if panel_id in self._panel_block_edits:
                     edits = self._panel_block_edits.get(panel_id, [])
                     if 0 <= row < len(edits):
                         edits.pop(row)
                         self._panel_block_edits[panel_id] = edits
+            # Remove all corresponding rectangles from MainWindow._panel_rects
+            mw = self.main_window
+            block_ids_to_remove = set(bid for _, bid in rows_and_block_ids if bid)
+            if mw and hasattr(mw, '_panel_rects') and block_ids_to_remove:
+                rects = mw._panel_rects.get(panel_id, [])
+                new_rects = [r for r in rects if r.get('id') not in block_ids_to_remove]
+                mw._panel_rects[panel_id] = new_rects
+                # Update the preview
+                if hasattr(mw.panelGrid, 'showOcrOverlay'):
+                    mw.panelGrid.showOcrOverlay(panel_id, new_rects)
+            # Renumber block card labels only (preserve text)
+            self.renumberBlockCardLabels()
 
     def _addBlock(self):
         # Add a new empty editable OCR block card at the end
@@ -431,7 +444,7 @@ class SidePanel(QWidget):
         else:
             self.title.setText("No panel selected")
         self.blocksList.clear()
-        self.translationEdit.clear()
+        self.translationList.clear()
         self.dictEdit.clear()
         self.similarityList.clear()
 
@@ -447,31 +460,54 @@ class SidePanel(QWidget):
         self._active_block_label = getattr(self, '_active_block_label', None)
         for idx, block in enumerate(blocks):
             try:
-                if edited_blocks and idx < len(edited_blocks):
+                #Prefer user-edited text; else extract textual payload only
+                if edited_blocks and idx < len(edited_blocks) and isinstance(edited_blocks[idx], str):
                     text = edited_blocks[idx]
+                elif isinstance(block, dict):
+                    text = block.get('text', '')
+                elif isinstance(block, str):
+                    text = block
                 else:
-                    text = block.get('text', '') if isinstance(block, dict) else str(block)
+                    text = ''
+                text = block.get('text', '')
                 w = QWidget(self.blocksList)
                 h = QHBoxLayout(w)
                 h.setContentsMargins(8, 6, 8, 6)
-                label = QLabel(str(text), w)
-                label.setStyleSheet("font-size: 15px; padding: 6px;")
-                label.setMinimumWidth(220)
-                h.addWidget(label, 1)
+                # Add block number label
+                num_label = QLabel(f"{idx+1}", w)
+                num_label.setStyleSheet("color: #888; font-size: 13px; font-weight: bold; padding-right: 8px;")
+                num_label.setFixedWidth(24)
+                h.addWidget(num_label, 0)
+                # Wrap text_label in a container for easy swap
+                text_container = QWidget(w)
+                text_layout = QVBoxLayout(text_container)
+                text_layout.setContentsMargins(0, 0, 0, 0)
+                text_label = QLabel(str(text), text_container)
+                text_label.setStyleSheet("font-size: 15px; padding: 6px;")
+                text_label.setMinimumWidth(220)
+                text_layout.addWidget(text_label)
+                h.addWidget(text_container, 1)
                 item = QListWidgetItem(self.blocksList)
                 item.setSizeHint(w.sizeHint())
                 self.blocksList.addItem(item)
                 self.blocksList.setItemWidget(item, w)
 
+                # Assign block_id to the widget for removal logic
+                block_id = None
+                if isinstance(block, dict) and 'id' in block:
+                    block_id = block['id']
+                else:
+                    block_id = f"{panel_id}_{idx}"
+                setattr(w, 'block_id', block_id)
+
                 # Dedicated event filter for each label
                 class LabelEditFilter(QObject):
-                    def __init__(self, label, layout, idx, panel_id, parent_widget, sidepanel):
+                    def __init__(self, label, container, idx, panel_id, sidepanel):
                         super().__init__(label)
                         self.label = label
-                        self.layout = layout
+                        self.container = container
                         self.idx = idx
                         self.panel_id = panel_id
-                        self.parent_widget = parent_widget
                         self.sidepanel = sidepanel
                     def eventFilter(self, obj, event):
                         if obj is self.label and event.type() == event.Type.MouseButtonDblClick:
@@ -479,26 +515,25 @@ class SidePanel(QWidget):
                             if self.sidepanel._active_block_editor is not None:
                                 prev_edit = self.sidepanel._active_block_editor
                                 prev_label = self.sidepanel._active_block_label
-                                prev_layout = prev_label.parent().layout()
+                                prev_container = prev_label.parent()
                                 prev_label.setText(prev_edit.text())
-                                prev_layout.removeWidget(prev_edit)
+                                prev_container.layout().removeWidget(prev_edit)
                                 prev_edit.deleteLater()
                                 prev_label.show()
                                 self.sidepanel._active_block_editor = None
                                 self.sidepanel._active_block_label = None
-                            self.layout.removeWidget(self.label)
                             self.label.hide()
-                            edit = QLineEdit(self.label.text(), self.parent_widget)
+                            edit = QLineEdit(self.label.text(), self.container)
                             edit.setMinimumWidth(220)
                             edit.setStyleSheet("font-size: 15px; padding: 6px;")
-                            self.layout.addWidget(edit, 1)
+                            self.container.layout().addWidget(edit)
                             edit.setFocus()
                             self.sidepanel._active_block_editor = edit
                             self.sidepanel._active_block_label = self.label
                             def finish_edit():
                                 self.sidepanel._onBlockEditFinished(self.panel_id, self.idx, edit.text())
                                 self.label.setText(edit.text())
-                                self.layout.removeWidget(edit)
+                                self.container.layout().removeWidget(edit)
                                 edit.deleteLater()
                                 self.label.show()
                                 self.sidepanel._active_block_editor = None
@@ -507,10 +542,10 @@ class SidePanel(QWidget):
                             return True
                         return False
 
-                filter_obj = LabelEditFilter(label, h, idx, panel_id, w, self)
-                label.installEventFilter(filter_obj)
+                filter_obj = LabelEditFilter(text_label, text_container, idx, panel_id, self)
+                text_label.installEventFilter(filter_obj)
             except Exception:
-                QListWidgetItem(str(text), self.blocksList)
+                QListWidgetItem("I broke.", self.blocksList)
 
     class EditOnDoubleClickFilter(QObject):
         """Event filter to enable editing on double-click for QLineEdit."""
@@ -571,7 +606,30 @@ class SidePanel(QWidget):
     def setTranslation(self, panel_id: str, translated: str):
         if panel_id != self.current_panel:
             return
-        self.translationEdit.setPlainText(translated)
+        self.translationList.clear()
+        # If translated is a string, split by lines; if list, use directly
+        if isinstance(translated, str):
+            blocks = [s.strip() for s in translated.split('\n') if s.strip()]
+        elif isinstance(translated, list):
+            blocks = [str(s) for s in translated]
+        else:
+            blocks = []
+        for idx, text in enumerate(blocks):
+            w = QWidget(self.translationList)
+            h = QHBoxLayout(w)
+            h.setContentsMargins(8, 6, 8, 6)
+            num_label = QLabel(f"{idx+1}", w)
+            num_label.setStyleSheet("color: #888; font-size: 13px; font-weight: bold; padding-right: 8px;")
+            num_label.setFixedWidth(24)
+            h.addWidget(num_label, 0)
+            label = QLabel(str(text), w)
+            label.setStyleSheet("font-size: 15px; padding: 6px;")
+            label.setMinimumWidth(220)
+            h.addWidget(label, 1)
+            item = QListWidgetItem(self.translationList)
+            item.setSizeHint(w.sizeHint())
+            self.translationList.addItem(item)
+            self.translationList.setItemWidget(item, w)
 
     def setDictionaryResult(self, panel_id: str, text: str):
         if panel_id != self.current_panel:
@@ -633,8 +691,37 @@ class MainWindow(QMainWindow):
     def _onRectsChanged(self, rects):
         # Update rectangles for the current panel when changed in the preview
         panel_id = getattr(self.sidePanel, 'current_panel', None)
-        if panel_id:
-            self._panel_rects[panel_id] = rects.copy()
+        if not panel_id:
+            return
+        self._panel_rects[panel_id] = rects.copy()
+
+        # Build the set of block IDs present in rects
+        rect_block_ids = set(rect.get('id') for rect in rects if 'id' in rect)
+        #print(f"[DEBUG] Updated rects for panel {panel_id} with block IDs: {list(rect_block_ids)}")
+
+        # Remove block cards whose block_id is not in rect_block_ids
+        blocks_to_remove = []
+        for i in range(self.sidePanel.blocksList.count()):
+            item = self.sidePanel.blocksList.item(i)
+            widget = self.sidePanel.blocksList.itemWidget(item)
+            if widget:
+                block_id = getattr(widget, 'block_id', None)
+                if block_id not in rect_block_ids:
+                    blocks_to_remove.append(i)
+        #print("[DEBUG] Removing block rows at indices:", blocks_to_remove)
+        for row in reversed(blocks_to_remove):
+            self.sidePanel.blocksList.takeItem(row)
+
+        # Debug: print remaining block IDs in blocksList after removal
+        # remaining_block_ids = []
+        # for i in range(self.sidePanel.blocksList.count()):
+        #     item = self.sidePanel.blocksList.item(i)
+        #     widget = self.sidePanel.blocksList.itemWidget(item)
+        #     if widget:
+        #         block_id = getattr(widget, 'block_id', None)
+        #         remaining_block_ids.append(block_id)
+        #print("[DEBUG] Remaining OCR block IDs after removal:", remaining_block_ids)
+        
     """Main application window with panel grid and detail side panel."""
 
     panelSelected = pyqtSignal(str)
@@ -704,8 +791,8 @@ class MainWindow(QMainWindow):
         self._stack = QWidget(self)
         stack_layout = QVBoxLayout(self._stack)
         stack_layout.setContentsMargins(0, 0, 0, 0)
-        # PanelsView presents a vertical list of thumbnails + larger preview
-        self.panelGrid = PanelsView(self._stack)
+        # PanelsChapterImagesPreview presents a vertical list of thumbnails + larger preview
+        self.panelGrid = PanelsChapterImagesPreview(self._stack)
         # Web view (conditional import)
         try:
             from PyQt6.QtWebEngineWidgets import QWebEngineView  # type: ignore
@@ -770,7 +857,7 @@ class MainWindow(QMainWindow):
         # Show webView by default for navigation experience.
         self.panelGrid.hide()
 
-        self.sidePanel = SidePanel(self)
+        self.sidePanel = RightSidePanel(self)
         # Widen right panel for better control visibility
         self.sidePanel.setFixedWidth(400)
         splitter = QSplitter(self)
@@ -897,7 +984,7 @@ class MainWindow(QMainWindow):
 
     def _onPanelSelected(self, panel_id: str):
         self.sidePanel.setPanel(panel_id)
-        # When a panel is selected, update the preview with its rectangles
+        # Only show rectangles overlay, do NOT show block cards until OCR is run
         rects = self._panel_rects.get(panel_id, [])
         self.panelGrid.showOcrOverlay(panel_id, rects)
         self.panelSelected.emit(panel_id)
@@ -937,6 +1024,9 @@ class MainWindow(QMainWindow):
         except Exception as e:
             show_selectable_message(self, "OCR", f"Cropping failed: {e}", QMessageBox.Icon.Warning)
             return
+        # Assign IDs to each rectangle using panel_id + crop_idx
+        for idx, rect in enumerate(rects):
+            rect['id'] = f"{panel_id}_{idx}"
         # Use preloaded adapter
         adapter = self._ocr_adapter
         try:
@@ -950,13 +1040,21 @@ class MainWindow(QMainWindow):
             preprocess = True
         # Start OCR in a background thread
         self._ocr_thread = QThread()
-        
         items = [(panel_id, crops)]
         self._ocr_worker = OcrWorker(items, lang, adapter, conf_thresh, preprocess=preprocess)
         self._ocr_worker.moveToThread(self._ocr_thread)
         self._ocr_thread.started.connect(self._ocr_worker.run)
-        def on_item_finished(panel_id, texts):
-            self.sidePanel.setOcrBlocks(panel_id, texts)
+        def on_item_finished(panel_id, results):
+            # Map returned texts to rect IDs in the same order
+            rects_for_panel = self._panel_rects.get(panel_id, [])
+            blocks_with_ids = []
+            for idx, result in enumerate(results or []):
+                rect_id = None
+                if idx < len(rects_for_panel):
+                    rect_id = rects_for_panel[idx].get('id')
+                    text=result.get('text', '')
+                blocks_with_ids.append({'id': rect_id or f"{panel_id}_{idx}", 'text': text})
+            self.sidePanel.setOcrBlocks(panel_id, blocks_with_ids)
             self._ocr_thread.quit()
             self._ocr_worker.deleteLater()
             self._ocr_thread.deleteLater()
@@ -1366,7 +1464,7 @@ class MainWindow(QMainWindow):
         self._ensureWebVisible()
 
     def _onRemovePanel(self):
-        # Remove selected panels from the PanelsView (or fallback)
+        # Remove selected panels from the PanelsChapterImagesPreview (or fallback)
         removed: list[str] = []
         if hasattr(self.panelGrid, 'selectedPanelIds'):
             removed = self.panelGrid.selectedPanelIds()
@@ -1504,7 +1602,7 @@ class MainWindow(QMainWindow):
             try:
                 if batch_errors:
                     max_show = 8
-                    lines = [f"{u}: {e}" for u, e in batch_errors[:max_show]]
+                    lines = [f"{pid}: {err}" for pid, err in batch_errors[:max_show]]
                     more = len(batch_errors) - len(lines)
                     if more > 0:
                         lines.append(f"... and {more} more errors")
@@ -2335,5 +2433,3 @@ class OcrWorker(QObject):
 def create_app_window() -> MainWindow:
     """Factory to create the fully constructed MainWindow."""
     return MainWindow()
-
-
