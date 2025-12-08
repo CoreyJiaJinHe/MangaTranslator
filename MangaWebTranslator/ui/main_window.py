@@ -147,6 +147,7 @@ class MainWindow(QMainWindow):
     def _createActions(self):
         self.actLoad = QAction("Load Images", self)
         self.actDetectAll = QAction("Detect All Regions", self)
+        self.actOcrAll = QAction("OCR All", self)
         self.actTranslateSel = QAction("Translate Selected", self)
         self.actExport = QAction("Export Text", self)
         self.actOpenUrl = QAction("Open URL", self)
@@ -162,6 +163,7 @@ class MainWindow(QMainWindow):
         tb.setIconSize(QSize(16, 16))
         tb.addAction(self.actLoad)
         tb.addAction(self.actDetectAll)
+        tb.addAction(self.actOcrAll)
         tb.addAction(self.actTranslateSel)
         tb.addAction(self.actExport)
         tb.addSeparator()
@@ -270,6 +272,7 @@ class MainWindow(QMainWindow):
             pass
         self.actLoad.triggered.connect(self._onLoadImages)
         self.actDetectAll.triggered.connect(self._onDetectAll)
+        self.actOcrAll.triggered.connect(self._ocr_all_panels_regions)
         self.actTranslateSel.triggered.connect(self._onTranslateSelected)
         self.actExport.triggered.connect(self._onExport)
         self.actOpenUrl.triggered.connect(self._onOpenUrl)
@@ -380,19 +383,12 @@ class MainWindow(QMainWindow):
             self.sidePanel.setOcrBlocks(panel_id, ocr_blocks)
         self.panelSelected.emit(panel_id)
 
-    def _onRequestOcr(self, _panel_id: str):
-        """OCR only selected panels' regions; if none selected, OCR the currently previewing panel."""
-        # Get selected panels, or fallback to current panel
-        if hasattr(self.panelGrid, 'selectedPanelIds'):
-            sel = self.panelGrid.selectedPanelIds()
-        else:
-            sel = []
-        panel_ids = sel if sel else [self.sidePanel.current_panel]
-        if not panel_ids or not panel_ids[0]:
+    def _onRequestOcr(self):
+        """OCR only the currently previewing panel's regions."""
+        panel_id = self.sidePanel.current_panel
+        if not panel_id:
             show_info_message(self, "OCR", "No panel selected.")
             return
-        # Only OCR the first panel in the list (button is for single-panel OCR)
-        panel_id = panel_ids[0]
         pm = getattr(self.panelGrid, '_pixmaps', {}).get(panel_id)
         if not pm:
             show_info_message(self, "OCR", f"Panel not found: {panel_id}")
@@ -462,28 +458,73 @@ class MainWindow(QMainWindow):
 
     def _ocr_all_panels_regions(self):
         """
-        Not exposed: OCR all loaded panels' regions. For future batch OCR feature.
+        Perform OCR on all loaded panels' regions.
         """
-        for panel_id, pm in getattr(self.panelGrid, '_pixmaps', {}).items():
+        pixmaps = getattr(self.panelGrid, '_pixmaps', {})
+        panel_ids = list(pixmaps.keys())
+        total = len(panel_ids)
+        if total == 0:
+            show_info_message(self, "OCR All", "No panels loaded.")
+            return
+        from PyQt6.QtWidgets import QProgressDialog
+        progress = QProgressDialog("Performing OCR...", "Cancel", 0, total, self)
+        progress.setWindowTitle("OCR All Panels")
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.show()
+        cancelled = [False]
+        for idx, panel_id in enumerate(panel_ids):
+            if progress.wasCanceled():
+                cancelled[0] = True
+                break
+            pm = pixmaps.get(panel_id)
+            if pm is None or pm.isNull():
+                continue
             rects = self._panel_rects.get(panel_id, [])
             if not rects:
                 continue
             try:
                 qimg = pm.toImage()
                 pil_img = qimage_to_pil(qimg)
-                crops = crop_regions(pil_img, rects, pad=2)
-            except Exception:
+            except Exception as e:
+                show_selectable_message(self, "OCR All", f"Failed to prepare image for {panel_id}: {e}", QMessageBox.Icon.Warning)
                 continue
+            try:
+                crops = crop_regions(pil_img, rects, pad=2)
+            except Exception as e:
+                show_selectable_message(self, "OCR All", f"Cropping failed for {panel_id}: {e}", QMessageBox.Icon.Warning)
+                continue
+            for idx_rect, rect in enumerate(rects):
+                rect['id'] = f"{panel_id}_{idx_rect}"
             adapter = self._ocr_adapter
             try:
                 st = self.sidePanel.getOcrSettings()
                 lang = st.get('lang', 'jpn')
+                conf_thresh = int(st.get('conf_thresh', 240) or 240)
+                preprocess = bool(st.get('preprocess', True))
             except Exception:
                 lang = 'jpn'
-            # This is a placeholder for future batch threading/aggregation logic
-            # For now, just a stub for future work
-            # Example: texts = [adapter.recognize(crop, lang=lang) for crop in crops]
-            pass
+                conf_thresh = 240
+                preprocess = True
+            # Synchronous OCR for each panel (could be threaded for performance)
+            try:
+                texts = [adapter.recognize(crop, lang=lang, conf_thresh=conf_thresh, preprocess=preprocess) for crop in crops]
+            except Exception as e:
+                show_selectable_message(self, "OCR All", f"OCR failed for {panel_id}: {e}", QMessageBox.Icon.Warning)
+                continue
+            blocks_with_ids = []
+            for idx_rect, result in enumerate(texts):
+                rect_id = rects[idx_rect].get('id') if idx_rect < len(rects) else f"{panel_id}_{idx_rect}"
+                text = result.get('text', '') if isinstance(result, dict) else str(result)
+                blocks_with_ids.append({'id': rect_id, 'text': text})
+            self._panel_ocr_results[panel_id] = blocks_with_ids.copy()
+            self.sidePanel.setOcrBlocks(panel_id, blocks_with_ids)
+            progress.setValue(idx + 1)
+            QApplication.processEvents()
+        progress.close()
+        if cancelled[0]:
+            show_info_message(self, "OCR All", "OCR cancelled.")
+        else:
+            show_info_message(self, "OCR All", f"OCR completed for {total} panels.")
 
     def _onRequestTranslate(self, panel_id: str):
         # Placeholder translation echo.

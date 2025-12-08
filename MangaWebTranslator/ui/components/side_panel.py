@@ -61,19 +61,19 @@ class PanelRightOutput(QWidget):
         translateRow.addWidget(self.txBtn)
         outer.addLayout(translateRow)
 
-        # Translation output
-        outer.addWidget(QLabel("Translation:"))
-        # Translation output as cards
-        self.translationList = QListWidget(self)
-        self.translationList.setSelectionMode(QListWidget.SelectionMode.NoSelection)
-        outer.addWidget(self.translationList, 1)
-
         # Dictionary / similarity placeholders
         outer.addWidget(QLabel("Dictionary Lookup (stub):"))
         self.dictEdit = QTextEdit(self)
         self.dictEdit.setPlaceholderText("Kanji definitions will appear here.")
         self.dictEdit.setReadOnly(True)
         outer.addWidget(self.dictEdit, 1)
+
+        # Translation output
+        outer.addWidget(QLabel("Translation:"))
+        # Translation output as cards
+        self.translationList = QListWidget(self)
+        self.translationList.setSelectionMode(QListWidget.SelectionMode.NoSelection)
+        outer.addWidget(self.translationList, 1)
 
         outer.addWidget(QLabel("Similarity Suggestions (stub):"))
         self.similarityList = QListWidget(self)
