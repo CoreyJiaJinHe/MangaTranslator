@@ -97,15 +97,15 @@ class MainWindow(QMainWindow):
         for row in reversed(blocks_to_remove):
             self.sidePanel.blocksList.takeItem(row)
 
-        # Debug: print remaining block IDs in blocksList after removal
-        # remaining_block_ids = []
-        # for i in range(self.sidePanel.blocksList.count()):
-        #     item = self.sidePanel.blocksList.item(i)
-        #     widget = self.sidePanel.blocksList.itemWidget(item)
-        #     if widget:
-        #         block_id = getattr(widget, 'block_id', None)
-        #         remaining_block_ids.append(block_id)
-        #print("[DEBUG] Remaining OCR block IDs after removal:", remaining_block_ids)
+        # Remove OCR results for blocks that no longer exist, but do NOT renumber block IDs
+        if panel_id in self._panel_ocr_results:
+            # Only keep OCR blocks whose id is still present in rect_block_ids
+            filtered_blocks = [b for b in self._panel_ocr_results[panel_id] if b.get('id') in rect_block_ids]
+            if filtered_blocks:
+                self._panel_ocr_results[panel_id] = filtered_blocks
+                self.sidePanel.setOcrBlocks(panel_id, filtered_blocks)
+            else:
+                del self._panel_ocr_results[panel_id]
         
     """Main application window with panel grid and detail side panel."""
 
@@ -131,6 +131,8 @@ class MainWindow(QMainWindow):
         self._ocr_adapter = create_ocr()
         # Store rectangles per panel_id
         self._panel_rects = {}  # panel_id -> list of rects
+        # Store OCR results per panel_id (in-memory only)
+        self._panel_ocr_results = {}  # panel_id -> list of OCR blocks
         # Load persisted config and apply OCR settings (creates config file if missing)
         try:
             cfg = self._load_config()
@@ -144,7 +146,7 @@ class MainWindow(QMainWindow):
     # ----------------------- UI Construction -----------------------
     def _createActions(self):
         self.actLoad = QAction("Load Images", self)
-        self.actOcrAll = QAction("OCR Panels", self)
+        self.actDetectAll = QAction("Detect All Regions", self)
         self.actTranslateSel = QAction("Translate Selected", self)
         self.actExport = QAction("Export Text", self)
         self.actOpenUrl = QAction("Open URL", self)
@@ -159,7 +161,7 @@ class MainWindow(QMainWindow):
         tb = QToolBar("Main")
         tb.setIconSize(QSize(16, 16))
         tb.addAction(self.actLoad)
-        tb.addAction(self.actOcrAll)
+        tb.addAction(self.actDetectAll)
         tb.addAction(self.actTranslateSel)
         tb.addAction(self.actExport)
         tb.addSeparator()
@@ -267,7 +269,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self.actLoad.triggered.connect(self._onLoadImages)
-        self.actOcrAll.triggered.connect(self._onOcrAll)
+        self.actDetectAll.triggered.connect(self._onDetectAll)
         self.actTranslateSel.triggered.connect(self._onTranslateSelected)
         self.actExport.triggered.connect(self._onExport)
         self.actOpenUrl.triggered.connect(self._onOpenUrl)
@@ -372,6 +374,10 @@ class MainWindow(QMainWindow):
         # Only show rectangles overlay, do NOT show block cards until OCR is run
         rects = self._panel_rects.get(panel_id, [])
         self.panelGrid.showOcrOverlay(panel_id, rects)
+        # Restore OCR results if present for this panel
+        ocr_blocks = self._panel_ocr_results.get(panel_id)
+        if ocr_blocks:
+            self.sidePanel.setOcrBlocks(panel_id, ocr_blocks)
         self.panelSelected.emit(panel_id)
 
     def _onRequestOcr(self, _panel_id: str):
@@ -437,8 +443,10 @@ class MainWindow(QMainWindow):
                 rect_id = None
                 if idx < len(rects_for_panel):
                     rect_id = rects_for_panel[idx].get('id')
-                    text=result.get('text', '')
+                    text = result.get('text', '')
                 blocks_with_ids.append({'id': rect_id or f"{panel_id}_{idx}", 'text': text})
+            # Save OCR results for this panel in memory
+            self._panel_ocr_results[panel_id] = blocks_with_ids.copy()
             self.sidePanel.setOcrBlocks(panel_id, blocks_with_ids)
             self._ocr_thread.quit()
             self._ocr_worker.deleteLater()
@@ -482,18 +490,12 @@ class MainWindow(QMainWindow):
         translated = "(EN) " + "; ".join(["example", "sample", "test"])
         self.translationCompleted.emit(panel_id, translated)
 
-    def _onRequestDetectRegions(self, _panel_id: str):
-        """Detect regions for selected panels, or current if none selected."""
-        if hasattr(self.panelGrid, 'selectedPanelIds'):
-            sel = self.panelGrid.selectedPanelIds()
-        else:
-            sel = []
-        panel_ids = sel if sel else [self.sidePanel.current_panel]
-        if not panel_ids or not panel_ids[0]:
+    def _onRequestDetectRegions(self):
+        """Detect regions for the currently previewed panel only."""
+        panel_id = self.sidePanel.current_panel
+        if not panel_id:
             show_info_message(self, "Detect Regions", "No panel selected.")
             return
-        # Only process the first panel for now (single-panel detect)
-        panel_id = panel_ids[0]
         pm = getattr(self.panelGrid, '_pixmaps', {}).get(panel_id)
         if pm is None or pm.isNull():
             show_info_message(self, "Detect Regions", "No image for the selected panel.")
@@ -509,14 +511,16 @@ class MainWindow(QMainWindow):
         try:
             st = self.sidePanel.getOcrSettings()
             blur_enabled = bool(st.get('preprocess', True))
+            threshold = int(st.get('conf_thresh', 240) or 240)
         except Exception:
             blur_enabled = False
+            threshold = 240
         # Run detection
         try:
             rects = detect_text_regions(
                 pil_img,
                 blur=blur_enabled,
-                fixed_threshold=240,
+                fixed_threshold=threshold,
                 subsume_ratio_primary=0.8,
                 kernel_trials=[(3, 5, 1), (5, 10, 2), (5, 15, 4), (7, 7, 2)],
             )
@@ -561,7 +565,8 @@ class MainWindow(QMainWindow):
 
     # ----------------------- Region Detection (GUI stubs) -----------------------
     def previewDetectedRegions(self, panel_id: str, rects: list[dict]) -> None:
-        """Preview detected regions as overlay boxes on the panel preview, and store per-panel rectangles."""
+        """Preview detected regions as overlay boxes on the panel preview, 
+        and store per-panel rectangles."""
         if not rects or not isinstance(rects, list):
             return
         # Store rectangles for this panel
@@ -590,107 +595,59 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def _onOcrAll(self):
-        # Run OCR on selected panels if any, otherwise on all visible panels.
-        ids: list[str]
-        if hasattr(self.panelGrid, 'selectedPanelIds'):
-            sel = self.panelGrid.selectedPanelIds()
-            ids = sel if sel else self.panelGrid.allVisiblePanelIds()
-        else:
-            # fallback for legacy PanelGrid
-            ids = [getattr(card, 'panel_id', str(card)) for card in self.panelGrid._cards]
-
-        total = len(ids)
-        if total == 0:
-            QMessageBox.information(self, "OCR", "No panels to OCR.")
-            return
-        # Prepare (panel_id, QImage) items for batch processing
-        items: list[tuple[str, object]] = []
-        for pid in ids:
-            pm = getattr(self.panelGrid, '_pixmaps', {}).get(pid)
-            if pm:
-                items.append((pid, pm.toImage()))
-
-        if not items:
-            show_info_message(self, "OCR", "No panel images available for OCR.")
-            return
-
+    def _onDetectAll(self):
+        """Detect regions for all loaded panels."""
         from PyQt6.QtWidgets import QProgressDialog
-        progress = QProgressDialog("Running OCR...", "Cancel", 0, len(items), self)
-        progress.setWindowTitle("OCR Panels")
+        pixmaps = getattr(self.panelGrid, '_pixmaps', {})
+        panel_ids = list(pixmaps.keys())
+        total = len(panel_ids)
+        if total == 0:
+            show_info_message(self, "Detect Regions", "No panels loaded.")
+            return
+        progress = QProgressDialog("Detecting regions...", "Cancel", 0, total, self)
+        progress.setWindowTitle("Detect All Regions")
         progress.setWindowModality(Qt.WindowModality.ApplicationModal)
         progress.show()
-
-        # Get OCR settings from side panel
-        try:
-            st = self.sidePanel.getOcrSettings()
-            lang = st.get('lang', 'jpn')
-            conf = int(st.get('conf_thresh', 0) or 0)
-            pre = bool(st.get('preprocess', True))
-        except Exception:
-            lang, conf, pre = 'jpn', 0, True
-
-        # Use preloaded adapter
-        adapter = self._ocr_adapter
-        # Batch worker + thread
-        worker = OcrWorker(items, lang=lang, adapter=adapter, conf_thresh=conf, preprocess=pre)
-        thread = QThread(self)
-        worker.moveToThread(thread)
-
-        # Keep reference to allow cancel and avoid GC
-        self._activeOcrBatch = (thread, worker)
-
-        worker.itemFinished.connect(lambda pid, blocks: self.ocrCompleted.emit(pid, blocks))
-        # Collect per-item batch errors and show a single aggregated dialog after completion
-        batch_errors: list[tuple[str, str]] = []
-        def _collect_item_error(pid: str, err: str):
+        cancelled = [False]
+        for idx, panel_id in enumerate(panel_ids):
+            if progress.wasCanceled():
+                cancelled[0] = True
+                break
+            pm = pixmaps.get(panel_id)
+            if pm is None or pm.isNull():
+                continue
             try:
-                batch_errors.append((pid, err))
-            except Exception:
-                pass
-        try:
-            worker.error.connect(_collect_item_error)
-        except Exception:
-            pass
-        worker.progress.connect(lambda done, total: progress.setValue(done))
-
-        def on_finished(done_count: int):
-            progress.close()
-            show_info_message(self, "OCR", f"Processed {done_count} / {len(items)} panels.")
-            # If any per-item errors were collected, present a single aggregated warning.
+                qimg = pm.toImage()
+                pil_img = qimage_to_pil(qimg)
+            except Exception as e:
+                show_selectable_message(self, "Detect Regions", f"Failed to prepare image for {panel_id}: {e}", QMessageBox.Icon.Warning)
+                continue
             try:
-                if batch_errors:
-                    # Show up to a handful of errors to avoid overwhelming the user
-                    max_show = 8
-                    lines = [f"{pid}: {err}" for pid, err in batch_errors[:max_show]]
-                    more = len(batch_errors) - len(lines)
-                    if more > 0:
-                        lines.append(f"... and {more} more errors")
-                    QMessageBox.warning(self, "OCR Errors", "Errors occurred during OCR:\n" + "\n".join(lines))
+                st = self.sidePanel.getOcrSettings()
+                blur_enabled = bool(st.get('preprocess', True))
+                threshold = int(st.get('conf_thresh', 240) or 240)
             except Exception:
-                pass
+                blur_enabled = False
+                threshold = 240
             try:
-                worker.deleteLater()
-            except Exception:
-                pass
-            try:
-                thread.deleteLater()
-            except Exception:
-                pass
-            self._activeOcrBatch = None
-
-        worker.finished.connect(on_finished)
-        worker.finished.connect(thread.quit)
-        thread.started.connect(worker.run)
-        thread.start()
-
-        # Wire cancel
-        def on_cancel():
-            try:
-                worker.cancel()
-            except Exception:
-                pass
-        progress.canceled.connect(on_cancel)
+                rects = detect_text_regions(
+                    pil_img,
+                    blur=blur_enabled,
+                    fixed_threshold=threshold,
+                    subsume_ratio_primary=0.8,
+                    kernel_trials=[(3, 5, 1), (5, 10, 2), (5, 15, 4), (7, 7, 2)],
+                )
+            except Exception as e:
+                show_selectable_message(self, "Detect Regions", f"Detection failed for {panel_id}: {e}", QMessageBox.Icon.Warning)
+                continue
+            self.previewDetectedRegions(panel_id, rects)
+            progress.setValue(idx + 1)
+            QApplication.processEvents()
+        progress.close()
+        if cancelled[0]:
+            show_info_message(self, "Detect Regions", "Detection cancelled.")
+        else:
+            show_info_message(self, "Detect Regions", f"Detected regions for {total} panels.")
 
     def _onTranslateSelected(self):
         # If panels are selected in the panels view, translate those; otherwise translate the current panel.
@@ -855,6 +812,10 @@ class MainWindow(QMainWindow):
             removed = self.panelGrid.selectedPanelIds()
             if removed:
                 self.panelGrid.removeSelectedPanels()
+                # Remove only the rects and ocr_results for panels that are actually removed
+                for panel_id in removed:
+                    self._panel_rects.pop(panel_id, None)
+                    self._panel_ocr_results.pop(panel_id, None)
         else:
             show_info_message(self, "Remove", "Panel removal not supported for this view.")
             return
