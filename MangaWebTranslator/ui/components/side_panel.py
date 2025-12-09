@@ -1,16 +1,22 @@
 from __future__ import annotations
-from typing import List, Optional
+from typing import List, Optional, Dict
+import os
+import json
+import re
 
 from PyQt6.QtCore import Qt, pyqtSignal, QObject
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QListWidget, QTextEdit, QHBoxLayout, QPushButton,
-    QComboBox, QSpinBox, QCheckBox, QListWidgetItem, QLineEdit, QMenu, QMainWindow
+    QComboBox, QSpinBox, QCheckBox, QListWidgetItem, QLineEdit, QMenu, QMainWindow,
+    QMessageBox, QScrollArea, QSizePolicy
 )
 
 
 class PanelRightOutput(QWidget):
     # Store edited block texts per panel
     _panel_block_edits = {}
+    # Cached kanji dictionary loaded once
+    _kanji_dict_cache: Optional[Dict[str, str]] = None
     """Right-side detail pane showing OCR text blocks and translations."""
     requestOcr = pyqtSignal(str)
     requestTranslate = pyqtSignal(str)
@@ -54,19 +60,35 @@ class PanelRightOutput(QWidget):
         self.addBlockBtn.clicked.connect(self._addBlock)
         outer.addWidget(self.blocksList, 2)
 
-        # Place Translate beneath the blocks zone, aligned to the right
-        translateRow = QHBoxLayout()
-        translateRow.addStretch(1)
-        self.txBtn = QPushButton("Translate")
-        translateRow.addWidget(self.txBtn)
-        outer.addLayout(translateRow)
+        # Place Dictionary Lookup beneath the blocks zone, aligned to the right
+        lookupRow = QHBoxLayout()
+        lookupRow.addStretch(1)
+        self.dictLookupBtn = QPushButton("Dictionary Lookup")
+        lookupRow.addWidget(self.dictLookupBtn)
+        outer.addLayout(lookupRow)
 
-        # Dictionary / similarity placeholders
-        outer.addWidget(QLabel("Dictionary Lookup (stub):"))
-        self.dictEdit = QTextEdit(self)
-        self.dictEdit.setPlaceholderText("Kanji definitions will appear here.")
-        self.dictEdit.setReadOnly(True)
-        outer.addWidget(self.dictEdit, 1)
+        # Dictionary results container (rows of kanji squares per OCR block)
+        outer.addWidget(QLabel("Dictionary Lookup:"))
+        self.dictContainer = QWidget(self)
+        self.dictLayout = QVBoxLayout(self.dictContainer)
+        self.dictLayout.setContentsMargins(0, 0, 0, 0)
+        self.dictLayout.setSpacing(8)
+        # Wrap dictContainer in a QScrollArea for vertical scrolling
+        self.dictScrollArea = QScrollArea(self)
+        self.dictScrollArea.setWidgetResizable(True)
+        self.dictScrollArea.setWidget(self.dictContainer)
+        self.dictScrollArea.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.dictScrollArea.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.dictScrollArea.setMinimumHeight(300)
+        self.dictScrollArea.setMaximumHeight(400)
+        outer.addWidget(self.dictScrollArea, 1)
+
+        # Under dictionary: right-aligned Translate button (stub)
+        dictBtnRow = QHBoxLayout()
+        dictBtnRow.addStretch(1)
+        self.translateBtn = QPushButton("Translate")
+        dictBtnRow.addWidget(self.translateBtn)
+        outer.addLayout(dictBtnRow)
 
         # Translation output
         outer.addWidget(QLabel("Translation:"))
@@ -90,7 +112,8 @@ class PanelRightOutput(QWidget):
         self.current_panel: Optional[str] = None
         self.ocrBtn.clicked.connect(self._emit_ocr)
         self.detectBtn.clicked.connect(self._emit_detect_regions)
-        self.txBtn.clicked.connect(self._emit_translate)
+        self.dictLookupBtn.clicked.connect(self._on_dictionary_lookup)
+        self.translateBtn.clicked.connect(self._emit_translate)
 
         # OCR settings controls (language, confidence threshold, preprocess)
         settingsRow = QHBoxLayout()
@@ -213,7 +236,9 @@ class PanelRightOutput(QWidget):
             self.title.setText("No panel selected")
         self.blocksList.clear()
         self.translationList.clear()
-        self.dictEdit.clear()
+        # Clear dictionary container
+        if hasattr(self, 'dictLayout'):
+            self._clear_dict_container()
         self.similarityList.clear()
 
     def setOcrBlocks(self, panel_id: str, blocks: List):
@@ -399,10 +424,6 @@ class PanelRightOutput(QWidget):
             self.translationList.addItem(item)
             self.translationList.setItemWidget(item, w)
 
-    def setDictionaryResult(self, panel_id: str, text: str):
-        if panel_id != self.current_panel:
-            return
-        self.dictEdit.setPlainText(text)
 
     def setSimilarity(self, panel_id: str, items: List[str]):
         if panel_id != self.current_panel:
@@ -465,3 +486,177 @@ class PanelRightOutput(QWidget):
                 QMessageBox.information(self, "Detect Regions", "No panel selected.")
             except Exception:
                 pass
+
+    # ----------------------- Kanji dictionary helpers -----------------------
+    def _load_kanji_dict_once(self) -> Dict[str, str]:
+        """Load kanji dictionary JSON once and cache it."""
+        if PanelRightOutput._kanji_dict_cache is not None:
+            return PanelRightOutput._kanji_dict_cache
+        # Resolve path to data/kanji_merged.json relative to this file
+        root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        data_path = os.path.join(root, 'data', 'kanji_merged.json')
+        try:
+            with open(data_path, 'r', encoding='utf-8') as f:
+                dct = json.load(f)
+                # Normalize dictionary structure once if needed
+                if isinstance(dct, list):
+                    try:
+                        norm = {}
+                        for entry in dct:
+                            if isinstance(entry, dict):
+                                k = entry.get('kanji') or entry.get('char') or entry.get('k')
+                                if isinstance(k, str) and k:
+                                    norm[k] = entry
+                        dct = norm
+                    except Exception:
+                        dct = {}
+                PanelRightOutput._kanji_dict_cache = dct
+        except Exception:
+            PanelRightOutput._kanji_dict_cache = {}
+        
+        print(f"Kanji dictionary loaded with {len(PanelRightOutput._kanji_dict_cache)} entries.")
+        return PanelRightOutput._kanji_dict_cache
+
+    @staticmethod
+    def extract_unique_kanji(text: str) -> List[str]:
+        """Extract unique Kanji characters from text, filtering punctuation and duplicates."""
+        if not text:
+            return []
+        # Only keep CJK Unified Ideographs (basic range)
+        chars = [ch for ch in text if re.match(r"[\u4E00-\u9FFF]", ch)]
+        seen = set()
+        unique: List[str] = []
+        for ch in chars:
+            if ch not in seen:
+                seen.add(ch)
+                unique.append(ch)
+        return unique
+
+    def lookup_kanji_meanings(self, kanji_list: List[str]) -> Dict[str, str]:
+        """Lookup meanings in cached dictionary; return 'no meaning' when absent."""
+        dct = self._load_kanji_dict_once()
+        out: Dict[str, str] = {}
+        for k in kanji_list:
+            meaning = dct.get(k)
+            text = None
+            if isinstance(meaning, dict):
+                # Try common keys, supporting list or string values
+                for key in ('meaning', 'meanings', 'english', 'gloss', 'glosses', 'definition'):
+                    val = meaning.get(key)
+                    if val is None:
+                        continue
+                    if isinstance(val, list):
+                        val = ', '.join([str(x).strip() for x in val if str(x).strip()])
+                    if isinstance(val, str) and val.strip():
+                        text = val.strip()
+                        break
+            elif isinstance(meaning, list):
+                text = ', '.join([str(x).strip() for x in meaning if str(x).strip()]) or None
+            elif isinstance(meaning, str):
+                text = meaning.strip() or None
+            out[k] = text if text else 'no meaning'
+        return out
+
+    def extract_and_lookup_kanji(self, text: str) -> Dict[str, str]:
+        """Combined extraction and lookup for convenience."""
+        return self.lookup_kanji_meanings(self.extract_unique_kanji(text))
+
+    def _clear_dict_container(self) -> None:
+        layout = self.dictLayout
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+            else:
+                child = item.layout()
+                if child is not None:
+                    while child.count():
+                        sub = child.takeAt(0)
+                        sw = sub.widget()
+                        if sw is not None:
+                            sw.deleteLater()
+
+    def _on_dictionary_lookup(self):
+        """Render kanji squares per OCR block with meanings and Jisho stub button."""
+        if not self.current_panel:
+            try:
+                QMessageBox.information(self, 'Dictionary Lookup', 'No panel selected.')
+            except Exception:
+                pass
+            return
+        self._clear_dict_container()
+        edited = self._panel_block_edits.get(self.current_panel, [])
+        count = self.blocksList.count()
+        for i in range(count):
+            text = None
+            if edited and i < len(edited) and isinstance(edited[i], str) and edited[i].strip():
+                text = edited[i].strip()
+            else:
+                item = self.blocksList.item(i)
+                self._clear_dict_container()
+                edited = self._panel_block_edits.get(self.current_panel, [])
+                count = self.blocksList.count()
+                for i in range(count):
+                    text = None
+                    if edited and i < len(edited) and isinstance(edited[i], str) and edited[i].strip():
+                        text = edited[i].strip()
+                    else:
+                        item = self.blocksList.item(i)
+                        widget = self.blocksList.itemWidget(item)
+                        if widget:
+                            labels = widget.findChildren(QLabel)
+                            if labels:
+                                text = labels[-1].text().strip()
+                    if not text:
+                        continue  # skip empty blocks
+                    kanji_list = self.extract_unique_kanji(text)
+                    if not kanji_list:
+                        continue  # no kanji found
+                    meanings = self.lookup_kanji_meanings(kanji_list)
+
+                    # Build a horizontally scrollable row for potentially many kanji
+                    row_widget = QWidget()
+                    row_layout = QHBoxLayout(row_widget)
+                    row_layout.setContentsMargins(4, 4, 4, 4)
+                    row_layout.setSpacing(6)
+                    row_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)  # left-align kanji squares
+                    for k in kanji_list:
+                        cell = QWidget(row_widget)
+                        cell_layout = QVBoxLayout(cell)
+                        cell_layout.setContentsMargins(6, 6, 6, 2)
+                        cell_layout.setSpacing(4)
+                        lbl = QLabel(k, cell)
+                        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                        lbl.setFixedSize(48, 48)
+                        lbl.setStyleSheet('border:1px solid #999; border-radius:4px; padding:4px; font-size:22px;')
+                        lbl.setToolTip(meanings.get(k, 'no meaning'))
+                        try:
+                            lbl.setToolTipDuration(5000)
+                        except Exception:
+                            pass
+                        cell_layout.addWidget(lbl)
+                        btn = QPushButton('Jisho', cell)
+                        btn.setFixedWidth(40)
+                        btn.clicked.connect(lambda _=False, ch=k: self._on_jisho_lookup(ch))
+                        cell_layout.addWidget(btn)
+                        row_layout.addWidget(cell)
+                    # Do not set a fixed height; let the row expand to fit its contents
+                    # Place row_widget in a QScrollArea for horizontal scrolling if needed
+                    scroll = QScrollArea(self.dictContainer)
+                    scroll.setWidgetResizable(True)
+                    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+                    scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+                    # Set min/max height to fit kanji square and button (e.g., 100px)
+                    scroll.setMinimumHeight(100)
+                    scroll.setMaximumHeight(140)
+                    scroll.setWidget(row_widget)
+                    self.dictLayout.addWidget(scroll)
+
+
+    def _on_jisho_lookup(self, kanji: str):
+        """Stub for future API-based lookup via jisho.py."""
+        try:
+            QMessageBox.information(self, 'Jisho', f'Lookup stub for: {kanji}')
+        except Exception:
+            pass
