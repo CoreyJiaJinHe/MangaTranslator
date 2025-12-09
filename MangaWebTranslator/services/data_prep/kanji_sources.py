@@ -220,9 +220,11 @@ def parse_kanjidic2(xml_gz_path) -> List[KanjiRecord]:
                         # unknown type: keep in onyomi by default
                         onyomi.append(rtext)
             elif tag == 'meaning':
-                m = (sub.text or '').strip()
-                if m:
-                    meanings.append(m)
+                # Only keep meanings with no m_lang attribute (English)
+                if sub.get('m_lang') is None:
+                    m = (sub.text or '').strip()
+                    if m:
+                        meanings.append(m)
             elif tag == 'jlpt':
                 try:
                     jlpt = int((sub.text or '').strip())

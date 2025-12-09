@@ -181,6 +181,8 @@ class PanelRightOutput(QWidget):
                     mw.panelGrid.showOcrOverlay(panel_id, new_rects)
             # Renumber block card labels only (preserve text)
             self.renumberBlockCardLabels()
+            # Refresh kanji rows to match block cards
+            self._on_dictionary_lookup()
         elif chosen is delete_selected_action:
             selected_items = self.blocksList.selectedItems()
             rows_and_block_ids = []
@@ -193,7 +195,7 @@ class PanelRightOutput(QWidget):
             for row, _ in sorted(rows_and_block_ids, reverse=True):
                 self.blocksList.takeItem(row)
                 if panel_id in self._panel_block_edits:
-                    edits = self._panel_block_edits.get(panel_id, [])
+                    edits = self._panel_block_edits.get(panel_id, []);
                     if 0 <= row < len(edits):
                         edits.pop(row)
                         self._panel_block_edits[panel_id] = edits
@@ -209,6 +211,8 @@ class PanelRightOutput(QWidget):
                     mw.panelGrid.showOcrOverlay(panel_id, new_rects)
             # Renumber block card labels only (preserve text)
             self.renumberBlockCardLabels()
+            # Refresh kanji rows to match block cards
+            self._on_dictionary_lookup()
 
     def _addBlock(self):
         # Add a new empty editable OCR block card at the end
@@ -227,6 +231,11 @@ class PanelRightOutput(QWidget):
         # Persist when user finishes editing
         idx = self.blocksList.count() - 1
         edit.editingFinished.connect(lambda i=idx, e=edit: self._onBlockEditFinished(panel_id, i, e.text()))
+        # Refresh kanji rows to reflect the new block
+        try:
+            self._on_dictionary_lookup()
+        except Exception:
+            pass
 
     def setPanel(self, panel_id: str):
         self.current_panel = panel_id
@@ -443,6 +452,7 @@ class PanelRightOutput(QWidget):
             lbl = widget.findChild(QLabel)
             if lbl:
                 lbl.setText(str(i + 1))
+
 
     def _emit_ocr(self):
         pid = self.current_panel
