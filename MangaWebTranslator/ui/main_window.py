@@ -42,6 +42,7 @@ from PyQt6.QtWidgets import (
     QMenu
 )
 import json
+
 from MangaWebTranslator.ui.custom_widget.rect_preview import RectPreview
 from MangaWebTranslator.services.ocr.ocr_preprocess import qimage_to_pil, crop_regions, detect_text_regions
 from MangaWebTranslator.ui.components.panel_preview import PanelImageThumbnailCard, PanelsChapterImagesPreview
@@ -499,15 +500,11 @@ class MainWindow(QMainWindow):
             try:
                 st = self.sidePanel.getOcrSettings()
                 lang = st.get('lang', 'jpn')
-                conf_thresh = int(st.get('conf_thresh', 240) or 240)
-                preprocess = bool(st.get('preprocess', True))
             except Exception:
                 lang = 'jpn'
-                conf_thresh = 240
-                preprocess = True
             # Synchronous OCR for each panel (could be threaded for performance)
             try:
-                texts = [adapter.recognize(crop, lang=lang, conf_thresh=conf_thresh, preprocess=preprocess) for crop in crops]
+                texts = [adapter.recognize(crop, lang=lang) for crop in crops]
             except Exception as e:
                 show_selectable_message(self, "OCR All", f"OCR failed for {panel_id}: {e}", QMessageBox.Icon.Warning)
                 continue
