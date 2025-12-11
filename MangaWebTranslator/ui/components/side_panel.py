@@ -4,12 +4,13 @@ import os
 import json
 import re
 
-from PyQt6.QtCore import Qt, pyqtSignal, QObject
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QPoint
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QListWidget, QTextEdit, QHBoxLayout, QPushButton,
     QComboBox, QSpinBox, QCheckBox, QListWidgetItem, QLineEdit, QMenu, QMainWindow,
     QMessageBox, QScrollArea, QSizePolicy, QDialog
 )
+from PyQt6.QtGui import QIcon  # Import QIcon at the top of the file if not already
 
 
 class PanelRightOutput(QWidget):
@@ -707,98 +708,54 @@ class PanelRightOutput(QWidget):
         dlg = KanjiDrawPanel(ocr_callback, self)
         dlg.exec()
     
-from PyQt6.QtGui import QPainter, QPen, QPixmap
-
-# Kanji drawing panel for user input
-class KanjiDrawPanel(QDialog):
+from PyQt6.QtGui import QPainter, QPen, QPixmap, QIcon
+from PyQt6.QtCore import QSize
+class DrawingCanvas(QWidget):
     """
-    A panel for drawing kanji with mouse and sending to OCR.
+    Dedicated widget for drawing kanji, grid, and handling mouse events.
+    Prevents drawing on the tool row area.
     """
-    def __init__(self, ocr_callback=None, parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Draw Kanji")
         self.setFixedSize(400, 400)
-        self.canvas = QPixmap(400, 350)
+        self.canvas = QPixmap(400, 400)
         self.canvas.fill(Qt.GlobalColor.white)
         self.last_point = None
-        self.ocr_callback = ocr_callback
-
-        self.draw_button = QPushButton("Recognize Kanji", self)
-        self.draw_button.setGeometry(150, 360, 100, 30)
-        self.draw_button.clicked.connect(self.send_to_ocr)
         self.line_start = None
         self.line_end = None
         self.drawing_line = False
-        self.mode = 'free'  # 'free' or 'line'
+        self.mode = 'free'  # 'free', 'line', 'erase'
 
-        self.free_draw_btn = QPushButton("Free-draw", self)
-        self.free_draw_btn.setGeometry(20, 360, 100, 30)
-        self.free_draw_btn.setCheckable(True)
-        self.free_draw_btn.setChecked(True)
-        self.free_draw_btn.clicked.connect(self.set_free_draw)
+    def set_mode(self, mode):
+        self.mode = mode
 
-        self.line_draw_btn = QPushButton("Line tool", self)
-        self.line_draw_btn.setGeometry(280, 360, 100, 30)
-        self.line_draw_btn.setCheckable(True)
-        self.line_draw_btn.setChecked(False)
-        self.line_draw_btn.clicked.connect(self.set_line_draw)
- 
-        self.eraser_btn = QPushButton("Eraser", self)
-        self.eraser_btn.setGeometry(110, 360, 80, 30)
-        self.eraser_btn.setCheckable(True)
-        self.eraser_btn.setChecked(False)
-        self.eraser_btn.clicked.connect(self.set_eraser)
-    # Resolve path to data/kanji_merged.json relative to this file
-    def set_free_draw(self):
-        self.mode = 'free'
-        self.free_draw_btn.setChecked(True)
-        self.line_draw_btn.setChecked(False)
-        self.eraser_btn.setChecked(False)
-
-    def set_line_draw(self):
-        self.mode = 'line'
-        self.line_draw_btn.setChecked(True)
-        self.free_draw_btn.setChecked(False)
-        self.eraser_btn.setChecked(False)
-
-    def set_eraser(self):
-        self.mode = 'erase'
-        self.eraser_btn.setChecked(True)
-        self.free_draw_btn.setChecked(False)
-        self.line_draw_btn.setChecked(False)
+    def clear(self):
+        self.canvas.fill(Qt.GlobalColor.white)
+        self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        # Draw the canvas (user drawing)
         painter.drawPixmap(0, 0, self.canvas)
-
-        # Line tool preview: show black line following cursor until mouse release
+        # Draw grid only inside canvas area
+        grid_color = Qt.GlobalColor.lightGray
+        pen = QPen(grid_color, 1, Qt.PenStyle.SolidLine)
+        painter.setPen(pen)
+        w, h = 400, 400
+        for i in range(1, 2):
+            x = int(i * w / 2)
+            painter.drawLine(x, 0, x, h)
+            y = int(i * h / 2)
+            painter.drawLine(0, y, w, y)
+        for i in range(1, 4):
+            x = int(i * w / 4)
+            painter.drawLine(x, 0, x, h)
+            y = int(i * h / 4)
+            painter.drawLine(0, y, w, y)
+        # Line tool preview
         if self.mode == 'line' and self.drawing_line and self.line_start and self.line_end:
             pen = QPen(Qt.GlobalColor.black, 8, Qt.PenStyle.SolidLine)
             painter.setPen(pen)
             painter.drawLine(self.line_start, self.line_end)
-
-        # Draw grid: 2x2 large squares, each divided into 4 smaller squares (total 16)
-        grid_color = Qt.GlobalColor.lightGray
-        pen = QPen(grid_color, 1, Qt.PenStyle.SolidLine)
-        painter.setPen(pen)
-        w, h = 400, 350
-        # 2x2 large squares
-        for i in range(1, 2):
-            # Vertical
-            x = int(i * w / 2)
-            painter.drawLine(x, 0, x, h)
-            # Horizontal
-            y = int(i * h / 2)
-            painter.drawLine(0, y, w, y)
-        # 4x4 small squares (total 16)
-        for i in range(1, 4):
-            # Vertical
-            x = int(i * w / 4)
-            painter.drawLine(x, 0, x, h)
-            # Horizontal
-            y = int(i * h / 4)
-            painter.drawLine(0, y, w, y)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -806,7 +763,6 @@ class KanjiDrawPanel(QDialog):
                 self.last_point = event.position().toPoint()
             elif self.mode == 'erase':
                 self.last_point = event.position().toPoint()
-                # Immediately erase at the press point
                 painter = QPainter(self.canvas)
                 bg_color = self.canvas.toImage().pixelColor(0, 0)
                 pen = QPen(bg_color, 16, Qt.PenStyle.SolidLine)
@@ -830,7 +786,6 @@ class KanjiDrawPanel(QDialog):
         elif self.mode == 'erase':
             if event.buttons() & Qt.MouseButton.LeftButton and self.last_point:
                 painter = QPainter(self.canvas)
-                # Use the current canvas background color for erasing
                 bg_color = self.canvas.toImage().pixelColor(0, 0)
                 pen = QPen(bg_color, 16, Qt.PenStyle.SolidLine)
                 painter.setPen(pen)
@@ -839,7 +794,32 @@ class KanjiDrawPanel(QDialog):
                 self.update()
         elif self.mode == 'line':
             if self.drawing_line and self.line_start:
-                self.line_end = event.position().toPoint()
+                end_point = event.position().toPoint()
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    x1, y1 = self.line_start.x(), self.line_start.y()
+                    x2, y2 = end_point.x(), end_point.y()
+                    dx = abs(x2 - x1)
+                    dy = abs(y2 - y1)
+                    # Diagonal if within 10%
+                    if min(dx, dy) > 0 and abs(dx - dy) / max(dx, dy) <= 0.1:
+                        # Snap to perfect diagonal
+                        if dx > dy:
+                            sign = 1 if x2 > x1 else -1
+                            y2 = y1 + sign * dy if y2 > y1 else y1 - dy
+                            x2 = x1 + sign * dy if x2 > x1 else x1 - dy
+                        else:
+                            sign = 1 if y2 > y1 else -1
+                            x2 = x1 + sign * dx if x2 > x1 else x1 - dx
+                            y2 = y1 + sign * dx if y2 > y1 else y1 - dx
+                        self.line_end = QPoint(x2, y2)
+                    elif dx > dy:
+                        # Snap to horizontal
+                        self.line_end = QPoint(x2, y1)
+                    else:
+                        # Snap to vertical
+                        self.line_end = QPoint(x1, y2)
+                else:
+                    self.line_end = end_point
                 self.update()
 
     def mouseReleaseEvent(self, event):
@@ -856,8 +836,123 @@ class KanjiDrawPanel(QDialog):
                 self.line_end = None
                 self.update()
 
+    def get_image(self):
+        return self.canvas.toImage()
+# Kanji drawing panel for user input
+class KanjiDrawPanel(QDialog):
+    """
+    A panel for drawing kanji with mouse and sending to OCR.
+    """
+    def __init__(self, ocr_callback=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Draw Kanji")
+        margin=8
+        # Set panel size to fit content
+        self.setMinimumSize(400+2*margin, 500)
+        self.setMaximumSize(400+2*margin, 500)
+
+        # Main vertical layout
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(margin, margin, margin, margin)
+        main_layout.setSpacing(4)
+        self.setLayout(main_layout)
+
+        # Helper to resolve icon path relative to this file
+        def get_icon_path(filename):
+            return os.path.abspath(os.path.join(os.path.dirname(__file__), '../../icons', filename))
+
+        # Create a horizontal row for tool buttons at the top, left-aligned
+        tool_row = QHBoxLayout()
+        tool_row.setContentsMargins(0, 0, 0, 0)
+        tool_row.setSpacing(6)
+
+        # Set up Free-draw button with icon
+        self.free_draw_btn = QPushButton()
+        free_draw_icon_path = get_icon_path('pen-tool.png')
+        if os.path.exists(free_draw_icon_path):
+            self.free_draw_btn.setIcon(QIcon(free_draw_icon_path))
+        else:
+            print(f"[KanjiDrawPanel] Icon not found: {free_draw_icon_path}")
+        self.free_draw_btn.setIconSize(QSize(20, 20))
+        self.free_draw_btn.setFixedSize(32, 32)
+        self.free_draw_btn.setCheckable(True)
+        self.free_draw_btn.setChecked(True)
+        self.free_draw_btn.setToolTip("Free-draw")
+        self.free_draw_btn.clicked.connect(self.set_free_draw)
+        tool_row.addWidget(self.free_draw_btn)
+
+        # Set up Line tool button with icon
+        self.line_draw_btn = QPushButton()
+        line_tool_icon_path = get_icon_path('line-tool.png')
+        if os.path.exists(line_tool_icon_path):
+            self.line_draw_btn.setIcon(QIcon(line_tool_icon_path))
+        else:
+            print(f"[KanjiDrawPanel] Icon not found: {line_tool_icon_path}")
+        self.line_draw_btn.setIconSize(QSize(20, 20))
+        self.line_draw_btn.setFixedSize(32, 32)
+        self.line_draw_btn.setCheckable(True)
+        self.line_draw_btn.setChecked(False)
+        self.line_draw_btn.setToolTip("Line tool")
+        self.line_draw_btn.clicked.connect(self.set_line_draw)
+        tool_row.addWidget(self.line_draw_btn)
+
+        # Set up Eraser button with icon
+        self.eraser_btn = QPushButton()
+        eraser_icon_path = get_icon_path('eraser-tool.png')
+        if os.path.exists(eraser_icon_path):
+            self.eraser_btn.setIcon(QIcon(eraser_icon_path))
+        else:
+            print(f"[KanjiDrawPanel] Icon not found: {eraser_icon_path}")
+        self.eraser_btn.setIconSize(QSize(20, 20))
+        self.eraser_btn.setFixedSize(32, 32)
+        self.eraser_btn.setCheckable(True)
+        self.eraser_btn.setChecked(False)
+        self.eraser_btn.setToolTip("Eraser")
+        self.eraser_btn.clicked.connect(self.set_eraser)
+        tool_row.addWidget(self.eraser_btn)
+
+        # Add stretch to push buttons to the left
+        tool_row.addStretch(1)
+        main_layout.addLayout(tool_row)
+
+        # Add the dedicated drawing canvas widget below the tool row
+        self.drawing_canvas = DrawingCanvas(self)
+        main_layout.addWidget(self.drawing_canvas, alignment=Qt.AlignmentFlag.AlignTop)
+        self.ocr_callback = ocr_callback
+
+        # Tool button logic updates canvas mode
+        self.free_draw_btn.clicked.connect(lambda: self.drawing_canvas.set_mode('free'))
+        self.line_draw_btn.clicked.connect(lambda: self.drawing_canvas.set_mode('line'))
+        self.eraser_btn.clicked.connect(lambda: self.drawing_canvas.set_mode('erase'))
+
+        # Add the Recognize Kanji button at the bottom, outside the canvas
+        self.draw_button = QPushButton("Recognize Kanji")
+        self.draw_button.setFixedSize(120, 32)
+        self.draw_button.clicked.connect(self.send_to_ocr)
+        main_layout.addStretch(1)
+        main_layout.addWidget(self.draw_button, alignment=Qt.AlignmentFlag.AlignHCenter)
+
     def send_to_ocr(self):
-        # Convert QPixmap to image data for OCR
+        # Convert DrawingCanvas QPixmap to image data for OCR
         if self.ocr_callback:
-            image = self.canvas.toImage()
+            image = self.drawing_canvas.get_image()
             self.ocr_callback(image)
+
+    # Resolve path to data/kanji_merged.json relative to this file
+    def set_free_draw(self):
+        self.mode = 'free'
+        self.free_draw_btn.setChecked(True)
+        self.line_draw_btn.setChecked(False)
+        self.eraser_btn.setChecked(False)
+
+    def set_line_draw(self):
+        self.mode = 'line'
+        self.line_draw_btn.setChecked(True)
+        self.free_draw_btn.setChecked(False)
+        self.eraser_btn.setChecked(False)
+
+    def set_eraser(self):
+        self.mode = 'erase'
+        self.eraser_btn.setChecked(True)
+        self.free_draw_btn.setChecked(False)
+        self.line_draw_btn.setChecked(False)
