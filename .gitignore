@@ -8,3 +8,4 @@ MangaWebTranslator/data/
 junk do not use/
 /_ocr_debug/
 manga-image-translator-beta-0.2.1/
+test/jisho_cleaned_output.json

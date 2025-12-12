@@ -4,13 +4,17 @@ import os
 import json
 import re
 
-from PyQt6.QtCore import Qt, pyqtSignal, QObject, QPoint
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QPoint, QThread, pyqtSlot
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QListWidget, QTextEdit, QHBoxLayout, QPushButton,
     QComboBox, QSpinBox, QCheckBox, QListWidgetItem, QLineEdit, QMenu, QMainWindow,
     QMessageBox, QScrollArea, QSizePolicy, QDialog
 )
 from PyQt6.QtGui import QIcon  # Import QIcon at the top of the file if not already
+
+# Import JishoClient for dictionary lookup
+from MangaWebTranslator.services.dictionary.jisho import JishoClient
+from MangaWebTranslator.ui.components.JishoLookupPanel import JishoLookupPanel
 
 
 class PanelRightOutput(QWidget):
@@ -23,6 +27,9 @@ class PanelRightOutput(QWidget):
     requestTranslate = pyqtSignal(str)
     requestDetectRegions = pyqtSignal(str)
     ocrSettingsChanged = pyqtSignal()
+
+    # Shared JishoClient instance for all lookups
+    _jisho_client = JishoClient()
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -79,6 +86,9 @@ class PanelRightOutput(QWidget):
         self.dictLookupBtn = QPushButton("Dictionary Lookup")
         lookupRow.addWidget(self.dictLookupBtn)
         outer.addLayout(lookupRow)
+
+        # Prepare Jisho Lookup Panel (pop-up, not embedded)
+        self.jishoPanel = JishoLookupPanel(self)
 
         # Dictionary results container (rows of kanji squares per OCR block)
         outer.addWidget(QLabel("Dictionary Lookup:"))
@@ -677,13 +687,36 @@ class PanelRightOutput(QWidget):
                     self.dictLayout.addWidget(scroll)
 
 
-    def _on_jisho_lookup(self, kanji: str):
-        """Stub for future API-based lookup via jisho.py."""
-        try:
-            QMessageBox.information(self, 'Jisho', f'Lookup stub for: {kanji}')
-        except Exception:
-            pass
-        
+    # def _on_jisho_lookup(self, kanji: str):
+    #     """Stub for future API-based lookup via jisho.py."""
+    #     try:
+    #         QMessageBox.information(self, 'Jisho', f'Lookup stub for: {kanji}')
+    #     except Exception:
+    #         pass
+    def _on_jisho_lookup(self, keyword: str):
+        """
+        Non-blocking Jisho lookup using a thread, shows a pop-up dialog with results.
+        Only fetches and passes the result to the panel; display logic is handled by JishoLookupPanel.
+        """
+        class JishoWorker(QThread):
+            def __init__(self, client, keyword):
+                super().__init__()
+                self.client = client
+                self.keyword = keyword
+                self.result = None
+            def run(self):
+                self.result = self.client.search_jisho(self.keyword)
+
+        def handle_result():
+            # Called in main thread after worker finishes
+            result = worker.result
+            self.jishoPanel.display_result(result)
+            self.jishoPanel.show()
+            self.jishoPanel.exec()
+
+        worker = JishoWorker(self._jisho_client, keyword)
+        worker.finished.connect(handle_result)
+        worker.start()
         
     def _onDrawKanji(self):
         from MangaWebTranslator.ui.main_window import show_info_message
