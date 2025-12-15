@@ -247,6 +247,7 @@ def parse_kanjidic2(xml_gz_path) -> List[KanjiRecord]:
     return records
 
 
+
 def merge_kanji_records(vg: Sequence[KanjiRecord], kd: Sequence[KanjiRecord]) -> List[KanjiRecord]:
     """Merge KanjiVG stroke records and Kanjidic2 metadata into unified records.
 
@@ -426,42 +427,148 @@ def merge_joyo_into_records(merged: Sequence[KanjiRecord], joyo_map: dict) -> in
             updated += 1
     return updated
 
+def find_multi_char_entries(json_path: str | Path, min_chars: int = 2, limit: Optional[int] = None) -> List[dict]:
+    """Stream a large merged JSON array and find records whose `char` field
+    contains at least `min_chars` characters (e.g. "着陸").
+
+    This function is memory-friendly and does not load the entire file at once.
+
+    Args:
+        json_path: Path to the array-style JSON file (list of objects).
+        min_chars: Minimum number of characters in the `char` string to consider.
+        limit: Optional maximum number of findings to return (None = no limit).
+
+    Returns:
+        A list of matching objects (decoded dicts). Also prints each found `char`
+        and a final summary line.
+    """
+    p = Path(json_path)
+    if not p.exists():
+        raise FileNotFoundError(json_path)
+
+    results: List[dict] = []
+    decoder = json.JSONDecoder()
+
+    with p.open('r', encoding='utf8') as fh:
+        # Skip whitespace until array start
+        for ch in iter(lambda: fh.read(1), ''):
+            if ch.isspace():
+                continue
+            if ch == '[':
+                break
+            # if file begins with BOM or other, continue
+
+        buf = []
+        depth = 0
+        in_string = False
+        escape = False
+
+        while True:
+            c = fh.read(1)
+            if not c:
+                break
+            if in_string:
+                buf.append(c)
+                if escape:
+                    escape = False
+                elif c == '\\':
+                    escape = True
+                elif c == '"':
+                    in_string = False
+                continue
+
+            if c == '{':
+                depth += 1
+                buf.append(c)
+                # start collecting object
+                # read until matching brace
+                while depth > 0:
+                    ch = fh.read(1)
+                    if not ch:
+                        break
+                    buf.append(ch)
+                    if ch == '"':
+                        # enter string mode
+                        in_string = True
+                        escape = False
+                        # consume inside string in next loop
+                    elif not in_string:
+                        if ch == '{':
+                            depth += 1
+                        elif ch == '}':
+                            depth -= 1
+                obj_text = ''.join(buf)
+                buf = []
+                try:
+                    obj = json.loads(obj_text)
+                except Exception:
+                    try:
+                        obj, _ = decoder.raw_decode(obj_text)
+                    except Exception:
+                        obj = None
+                if isinstance(obj, dict):
+                    chv = obj.get('char')
+                    if isinstance(chv, str) and len(chv) >= min_chars:
+                        print(f"Found: {chv}")
+                        results.append(obj)
+                        if limit and len(results) >= limit:
+                            print(f"Limit {limit} reached, stopping.")
+                            break
+                # skip until next object or end of array
+                # consume following whitespace and optional comma
+                while True:
+                    nxt = fh.read(1)
+                    if not nxt or not nxt.isspace():
+                        break
+                if not nxt or nxt == ']':
+                    break
+                if nxt == ',':
+                    continue
+                # if it's something else, push back by seeking -1
+                fh.seek(fh.tell() - 1)
+
+    print(f"Total entries with >= {min_chars} characters in 'char': {len(results)}")
+    return results
+
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Parse KanjiVG + Kanjidic2 and merge.')
-    parser.add_argument('--svg-dir', default='MangaWebTranslator/data/kanjivg', help='Directory with .svg files')
-    parser.add_argument('--kanjidic', default='MangaWebTranslator/data/kanjidic2.xml.gz', help='Path to kanjidic2 xml (or .gz)')
-    parser.add_argument('--out', default='MangaWebTranslator/data/kanji_merged.json', help='Output JSON file')
-    parser.add_argument('--joyo-csv', default=None, help='Optional path to joyo.csv to merge additional metadata')
-    parser.add_argument('--stats', action='store_true', help='Only compute and print stats for the merged records')
-    args = parser.parse_args()
+    find_multi_char_entries('MangaWebTranslator/data/kanji_merged.json', min_chars=2)
+    
+    
+    # parser = argparse.ArgumentParser(description='Parse KanjiVG + Kanjidic2 and merge.')
+    # parser.add_argument('--svg-dir', default='MangaWebTranslator/data/kanjivg', help='Directory with .svg files')
+    # parser.add_argument('--kanjidic', default='MangaWebTranslator/data/kanjidic2.xml.gz', help='Path to kanjidic2 xml (or .gz)')
+    # parser.add_argument('--out', default='MangaWebTranslator/data/kanji_merged.json', help='Output JSON file')
+    # parser.add_argument('--joyo-csv', default=None, help='Optional path to joyo.csv to merge additional metadata')
+    # parser.add_argument('--stats', action='store_true', help='Only compute and print stats for the merged records')
+    # args = parser.parse_args()
 
-    print('Parsing KanjiVG from', args.svg_dir)
-    vg = parse_kanjivg_dir(args.svg_dir)
-    print('Parsed', len(vg), 'VG records')
+    # print('Parsing KanjiVG from', args.svg_dir)
+    # vg = parse_kanjivg_dir(args.svg_dir)
+    # print('Parsed', len(vg), 'VG records')
 
-    print('Parsing Kanjidic2 from', args.kanjidic)
-    kd = parse_kanjidic2(args.kanjidic)
-    print('Parsed', len(kd), 'KD records')
+    # print('Parsing Kanjidic2 from', args.kanjidic)
+    # kd = parse_kanjidic2(args.kanjidic)
+    # print('Parsed', len(kd), 'KD records')
 
-    merged = merge_kanji_records(vg, kd)
-    # If a joyo CSV exists, merge its data to fill gaps (stroke_count)
-    if args.joyo_csv:
-        try:
-            joyo_map = load_joyo_csv(args.joyo_csv)
-            updated = merge_joyo_into_records(merged, joyo_map)
-            print(f'Applied joyo.csv: updated {updated} records')
-        except Exception as e:
-            print('Failed to load/apply joyo.csv:', e)
-    print('Merged records:', len(merged))
+    # merged = merge_kanji_records(vg, kd)
+    # # If a joyo CSV exists, merge its data to fill gaps (stroke_count)
+    # if args.joyo_csv:
+    #     try:
+    #         joyo_map = load_joyo_csv(args.joyo_csv)
+    #         updated = merge_joyo_into_records(merged, joyo_map)
+    #         print(f'Applied joyo.csv: updated {updated} records')
+    #     except Exception as e:
+    #         print('Failed to load/apply joyo.csv:', e)
+    # print('Merged records:', len(merged))
 
-    if args.stats:
-        stats = compute_merged_stats(merged)
-        print('Merged stats:')
-        print(json.dumps(stats, indent=2, ensure_ascii=False))
-    else:
-        print('Saving merged JSON to', args.out)
-        save_merged_json(args.out, merged)
-        print('Done')
+    # if args.stats:
+    #     stats = compute_merged_stats(merged)
+    #     print('Merged stats:')
+    #     print(json.dumps(stats, indent=2, ensure_ascii=False))
+    # else:
+    #     print('Saving merged JSON to', args.out)
+    #     save_merged_json(args.out, merged)
+    #     print('Done')
 
 
