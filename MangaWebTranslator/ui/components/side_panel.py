@@ -15,6 +15,7 @@ from PyQt6.QtGui import QIcon  # Import QIcon at the top of the file if not alre
 # Import JishoClient for dictionary lookup
 from MangaWebTranslator.services.dictionary.jisho import JishoClient
 from MangaWebTranslator.ui.components.JishoLookupPanel import JishoLookupPanel
+from MangaWebTranslator.services.dictionary.jisho import JishoStorage
 
 
 class PanelRightOutput(QWidget):
@@ -30,7 +31,7 @@ class PanelRightOutput(QWidget):
 
     # Shared JishoClient instance for all lookups
     _jisho_client = JishoClient()
-
+    _jisho_storage = JishoStorage()
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         # Store a direct reference to MainWindow for rectangle sync
@@ -705,11 +706,18 @@ class PanelRightOutput(QWidget):
                 self.keyword = keyword
                 self.result = None
             def run(self):
+                print(f"Jisho lookup for: {self.keyword}")
                 self.result = self.client.search_jisho(self.keyword)
 
         def handle_result():
             # Called in main thread after worker finishes
             result = worker.result
+            # Persist Jisho results (JSON array + NDJSON). Do not block display on failures.
+            try:
+                if isinstance(result, dict):
+                    self._jisho_storage.save_jisho_response(result)
+            except Exception:
+                pass
             self.jishoPanel.display_result(result)
             self.jishoPanel.show()
             self.jishoPanel.exec()

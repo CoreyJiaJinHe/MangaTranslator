@@ -41,3 +41,7 @@ To improve contour detection and reduce false positives (wrong contours), consid
 
 7. **Debugging**:  
     - Visualize each step and compare overlays to see which parameters best isolate text.
+
+
+
+Work on making it so that the reordering of an ocr block card will also switch the numbers of the rects around.
